@@ -8,6 +8,8 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Primary;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.datasource.DataSourceTransactionManager;
+import org.springframework.transaction.PlatformTransactionManager;
 
 import javax.sql.DataSource;
 
@@ -87,5 +89,17 @@ public class DataSourceConfig {
     @Qualifier("targetJdbc")
     public JdbcTemplate targetJdbc(@Qualifier("targetDataSource") DataSource targetDataSource) {
         return new JdbcTemplate(targetDataSource);
+    }
+
+    // Bound explicitly to the target datasource rather than left to be
+    // inferred, since two DataSource beans exist and neither is marked
+    // primary at the DataSource level (only the JdbcTemplate above is).
+    // Anything in the store layer that needs more than one statement to
+    // commit together, such as removing a row from more than one target
+    // table, depends on this bean to make that atomic.
+    @Bean
+    public PlatformTransactionManager targetTransactionManager(
+            @Qualifier("targetDataSource") DataSource targetDataSource) {
+        return new DataSourceTransactionManager(targetDataSource);
     }
 }

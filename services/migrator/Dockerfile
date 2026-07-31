@@ -15,5 +15,6 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=build /build/target/migrator.jar app.jar
-EXPOSE 8080
+# No fixed EXPOSE here: the listening port comes from SERVER_PORT at
+# runtime and differs between the worker and coordinator profiles.
 ENTRYPOINT ["java", "-jar", "app.jar"]

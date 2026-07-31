@@ -155,10 +155,9 @@ services:
 
   # Migrator image, built once and run twice under different profiles. The
   # worker profile does per-file migration work; the coordinator profile
-  # plans backfill ranges. Neither profile does that work yet: this is the
-  # service skeleton and its data access layer, wired to both datasources,
-  # MinIO, and the ledger tables so later tasks can build the pipeline on
-  # top of it.
+  # plans backfill ranges. Both currently start up with their datasources,
+  # MinIO client, and ledger access wired and nothing more: no consumer,
+  # producer, or migration work runs yet.
   migrator-worker:
     build: ./services/migrator
     container_name: migrator-worker

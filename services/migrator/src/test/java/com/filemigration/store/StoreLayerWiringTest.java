@@ -10,8 +10,8 @@ import static org.mockito.Mockito.mock;
 
 /**
  * Proves the store layer types compile and wire together, and that the
- * Status and Stage values, along with the object key scheme, match exactly
- * what every later task builds on.
+ * Status and Stage values, along with the object key scheme, are exactly
+ * the fixed set every other component in the system relies on.
  */
 class StoreLayerWiringTest {
 

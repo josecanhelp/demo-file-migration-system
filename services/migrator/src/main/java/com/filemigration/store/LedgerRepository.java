@@ -5,6 +5,7 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.jdbc.core.ConnectionCallback;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.sql.Array;
 import java.sql.PreparedStatement;
@@ -24,10 +25,12 @@ import java.util.Map;
 @Repository
 public class LedgerRepository {
 
-    // Copied verbatim from the migration design: returning only the rows
-    // this call actually transitioned is what lets concurrent workers share
-    // a batch of ids safely, since a row already IN_FLIGHT or further along
-    // simply will not appear in the result.
+    // The RETURNING clause reports exactly which ids this statement moved
+    // into IN_FLIGHT. A row already IN_FLIGHT or further along matches
+    // neither status in the WHERE clause, so it is silently left out of
+    // the result instead of being claimed a second time. That is what
+    // lets several workers pull from the same batch of ids without two of
+    // them ever processing the same file at once.
     private static final String CLAIM_SQL =
             "UPDATE migration_state\n"
             + "   SET status = 'IN_FLIGHT', attempts = attempts + 1, updated_at = now()\n"
@@ -150,8 +153,12 @@ public class LedgerRepository {
 
     /**
      * Removes the ledger and migrated-document rows for a source file that
-     * no longer exists. Event history is left in place as an audit trail.
+     * no longer exists. Both deletes commit or roll back together, so a
+     * failure partway through never leaves a migration_state row with no
+     * matching document, or the reverse. Event history is left in place as
+     * an audit trail.
      */
+    @Transactional("targetTransactionManager")
     public void tombstone(long id) {
         targetJdbc.update("DELETE FROM document WHERE source_id = ?", id);
         targetJdbc.update("DELETE FROM migration_state WHERE source_id = ?", id);
