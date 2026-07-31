@@ -4,11 +4,32 @@ server:
 spring:
   application:
     name: migrator
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:kafka:9092}
+    admin:
+      fail-fast: false
+      operation-timeout: 3
+    consumer:
+      enable-auto-commit: false
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+    listener:
+      ack-mode: manual_immediate
 
 migrator:
   worker-concurrency: ${WORKER_CONCURRENCY:8}
   db-pool-size: ${DB_POOL_SIZE:0}
   claim-lease-seconds: ${CLAIM_LEASE_SECONDS:300}
+  backfill:
+    range-size: ${BACKFILL_RANGE_SIZE:1000}
+    range-lease-seconds: ${BACKFILL_RANGE_LEASE_SECONDS:300}
+    topic: files.backfill
+    topic-partitions: ${BACKFILL_TOPIC_PARTITIONS:3}
+    group-id: backfill
   mysql:
     host: ${MYSQL_HOST:mysql}
     port: ${MYSQL_PORT:3306}
@@ -31,6 +52,7 @@ migrator:
     base-url: ${VENDOR_BASE_URL:http://vendor-mock:8088}
     connect-timeout-ms: ${VENDOR_CONNECT_TIMEOUT_MS:2000}
     read-timeout-ms: ${VENDOR_READ_TIMEOUT_MS:10000}
+    batch-size: ${VENDOR_BATCH_SIZE:25}
 
 management:
   endpoints:

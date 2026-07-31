@@ -217,6 +217,25 @@ class LedgerRepositoryIT {
         assertEquals("cdc", row.get("lane"));
     }
 
+    @Test
+    void findUnresolvedExcludesOnlyDoneAndPermanentlyFailedRows() {
+        long done = BASE_ID + 30;
+        long permanentlyFailed = BASE_ID + 31;
+        long inFlight = BASE_ID + 32;
+        long retryable = BASE_ID + 33;
+        long pending = BASE_ID + 34;
+        insertState(done, "backfill", "DONE", 1);
+        insertState(permanentlyFailed, "backfill", "FAILED_PERMANENT", 1);
+        insertState(inFlight, "backfill", "IN_FLIGHT", 1);
+        insertState(retryable, "backfill", "FAILED_RETRYABLE", 1);
+        insertState(pending, "backfill", "PENDING", 0);
+
+        List<Long> unresolved = ledger.findUnresolved(
+                List.of(done, permanentlyFailed, inFlight, retryable, pending));
+
+        assertEquals(List.of(inFlight, retryable, pending), sorted(unresolved));
+    }
+
     private void insertState(long sourceId, String lane, String status, int attempts) {
         jdbcTemplate.update(
                 "INSERT INTO migration_state (source_id, lane, status, attempts) VALUES (?, ?, ?, ?)",

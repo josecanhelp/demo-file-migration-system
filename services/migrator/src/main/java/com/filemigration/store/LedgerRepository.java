@@ -152,6 +152,39 @@ public class LedgerRepository {
     }
 
     /**
+     * Returns whichever of the given ids has not yet reached a terminal
+     * status (DONE or FAILED_PERMANENT). claim() silently drops an id
+     * already owned by a live, unexpired claim without saying whether
+     * that claim ever actually finished it, which is not enough for a
+     * caller deciding whether it is safe to stop tracking a batch: an id
+     * left IN_FLIGHT by a worker that crashed moments ago is still owned,
+     * by the same reasoning, for as long as its lease has left to run, so
+     * it comes back from this method as unresolved rather than silently
+     * being treated the same as an id that is genuinely done.
+     */
+    public List<Long> findUnresolved(List<Long> ids) {
+        if (ids == null || ids.isEmpty()) {
+            return Collections.emptyList();
+        }
+        Long[] idArray = ids.toArray(new Long[0]);
+        return targetJdbc.execute((ConnectionCallback<List<Long>>) connection -> {
+            Array sqlArray = connection.createArrayOf("bigint", idArray);
+            String sql = "SELECT source_id FROM migration_state "
+                    + "WHERE source_id = ANY(?) AND status NOT IN ('DONE', 'FAILED_PERMANENT')";
+            try (PreparedStatement ps = connection.prepareStatement(sql)) {
+                ps.setArray(1, sqlArray);
+                try (ResultSet rs = ps.executeQuery()) {
+                    List<Long> unresolved = new ArrayList<>();
+                    while (rs.next()) {
+                        unresolved.add(rs.getLong("source_id"));
+                    }
+                    return unresolved;
+                }
+            }
+        });
+    }
+
+    /**
      * Stores the vendor OCR result for a claimed file and marks it
      * OCR_DONE, so a crash after this point does not pay for OCR again.
      */

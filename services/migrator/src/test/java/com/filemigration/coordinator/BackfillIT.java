@@ -1,0 +1,310 @@
+package com.filemigration.coordinator;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.filemigration.backfill.BackfillMessage;
+import com.filemigration.model.BackfillRange;
+import com.filemigration.store.BackfillCheckpointRepository;
+import com.filemigration.store.DocumentRepository;
+import com.filemigration.store.EventRepository;
+import com.filemigration.store.LedgerRepository;
+import com.filemigration.store.ObjectStore;
+import com.filemigration.store.SourceFileRepository;
+import com.filemigration.vendor.VendorClient;
+import com.filemigration.worker.BackfillConsumer;
+import com.filemigration.worker.MigrationService;
+import com.zaxxer.hikari.HikariDataSource;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.common.serialization.StringDeserializer;
+import org.apache.kafka.common.serialization.StringSerializer;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
+import org.springframework.boot.jdbc.DataSourceBuilder;
+import org.springframework.http.client.SimpleClientHttpRequestFactory;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.kafka.core.DefaultKafkaProducerFactory;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.core.ProducerFactory;
+import org.springframework.web.client.RestClient;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.S3Configuration;
+import software.amazon.awssdk.services.s3.model.GetObjectRequest;
+
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+/**
+ * Exercises the backfill lane end to end against the real Postgres,
+ * MySQL, MinIO, Kafka, and vendor-mock services docker compose starts:
+ * seeding a range through BackfillCoordinator really publishes to the
+ * real topic, and BackfillConsumer really consumes what lands there and
+ * drives it through to a document row and a MinIO object. If any real
+ * dependency is unreachable, connecting fails loudly here rather than
+ * being swallowed into a skip.
+ *
+ * Every row this test writes uses a source id at or above the reserved
+ * range below, which sits well clear of both the small ranges other
+ * repository tests use and anything the real range planner (which starts
+ * counting at 1) would produce for a modestly sized source table. Every
+ * one of those rows is removed after each test, and the vendor is reset
+ * to healthy after the class runs whether or not a test failed.
+ *
+ * Publishing and consuming both use a topic of this test's own rather
+ * than the real "files.backfill" topic the live coordinator and worker
+ * containers use: Kafka delivers a message to every consumer group
+ * subscribed to a topic independently, so publishing reserved test ids
+ * to the real topic would have the real "backfill" group's live worker
+ * racing this test to claim and process the very same ids. A dedicated
+ * topic means this test never contends with, and never depends on,
+ * whatever is actually running against the same compose network.
+ */
+class BackfillIT {
+
+    private static final long BASE_ID = 9_500_000L;
+    private static final String BUCKET = "documents";
+    private static final long LEDGER_LEASE_SECONDS = 300L;
+    private static final long CHECKPOINT_LEASE_SECONDS = 300L;
+    private static final String TOPIC = "files.backfill.it";
+    private static final int TEST_VENDOR_BATCH_SIZE = 2;
+
+    private static HikariDataSource targetDataSource;
+    private static HikariDataSource sourceDataSource;
+    private static JdbcTemplate targetJdbc;
+    private static JdbcTemplate sourceJdbc;
+    private static S3Client s3Client;
+    private static RestClient vendorAdminClient;
+    private static ProducerFactory<String, String> producerFactory;
+    private static KafkaTemplate<String, String> kafkaTemplate;
+    private static BackfillCoordinator coordinator;
+    private static BackfillConsumer consumer;
+    private static ObjectMapper objectMapper;
+
+    @BeforeAll
+    static void connect() {
+        String targetUrl = System.getenv().getOrDefault("TARGET_JDBC_URL",
+                "jdbc:postgresql://localhost:5432/targetdb");
+        String targetUser = System.getenv().getOrDefault("TARGET_JDBC_USERNAME", "postgres");
+        String targetPassword = System.getenv().getOrDefault("TARGET_JDBC_PASSWORD", "postgres");
+        targetDataSource = DataSourceBuilder.create()
+                .type(HikariDataSource.class)
+                .driverClassName("org.postgresql.Driver")
+                .url(targetUrl)
+                .username(targetUser)
+                .password(targetPassword)
+                .build();
+        targetJdbc = new JdbcTemplate(targetDataSource);
+        targetJdbc.queryForObject("SELECT 1", Integer.class);
+
+        String sourceUrl = System.getenv().getOrDefault("SOURCE_JDBC_URL",
+                "jdbc:mysql://localhost:3306/sourcedb?useSSL=false&allowPublicKeyRetrieval=true");
+        String sourceUser = System.getenv().getOrDefault("SOURCE_JDBC_USERNAME", "root");
+        String sourcePassword = System.getenv().getOrDefault("SOURCE_JDBC_PASSWORD", "root");
+        sourceDataSource = DataSourceBuilder.create()
+                .type(HikariDataSource.class)
+                .driverClassName("com.mysql.cj.jdbc.Driver")
+                .url(sourceUrl)
+                .username(sourceUser)
+                .password(sourcePassword)
+                .build();
+        sourceJdbc = new JdbcTemplate(sourceDataSource);
+        sourceJdbc.queryForObject("SELECT 1", Integer.class);
+
+        String minioEndpoint = System.getenv().getOrDefault("MINIO_ENDPOINT", "http://localhost:9000");
+        String minioAccessKey = System.getenv().getOrDefault("MINIO_ACCESS_KEY", "minioadmin");
+        String minioSecretKey = System.getenv().getOrDefault("MINIO_SECRET_KEY", "minioadmin");
+        s3Client = S3Client.builder()
+                .endpointOverride(URI.create(minioEndpoint))
+                .region(Region.of("us-east-1"))
+                .credentialsProvider(StaticCredentialsProvider.create(
+                        AwsBasicCredentials.create(minioAccessKey, minioSecretKey)))
+                .serviceConfiguration(S3Configuration.builder().pathStyleAccessEnabled(true).build())
+                .build();
+
+        String vendorBaseUrl = System.getenv().getOrDefault("VENDOR_BASE_URL", "http://localhost:8088");
+        vendorAdminClient = RestClient.create(vendorBaseUrl);
+        vendorAdminClient.get().uri("/health").retrieve().toBodilessEntity();
+        setVendorMode("healthy");
+
+        SimpleClientHttpRequestFactory requestFactory = new SimpleClientHttpRequestFactory();
+        requestFactory.setConnectTimeout(2000);
+        requestFactory.setReadTimeout(10000);
+        RestClient vendorRestClient = RestClient.builder()
+                .baseUrl(vendorBaseUrl)
+                .requestFactory(requestFactory)
+                .build();
+
+        objectMapper = new ObjectMapper();
+        LedgerRepository ledger = new LedgerRepository(targetJdbc, LEDGER_LEASE_SECONDS);
+        SourceFileRepository sourceRepo = new SourceFileRepository(sourceJdbc);
+        ObjectStore objectStore = new ObjectStore(s3Client, BUCKET);
+        DocumentRepository documentRepo = new DocumentRepository(targetJdbc);
+        EventRepository eventRepo = new EventRepository(targetJdbc);
+        VendorClient vendorClient = new VendorClient(vendorRestClient, objectMapper);
+        MigrationService migrationService = new MigrationService(ledger, sourceRepo, objectStore, documentRepo,
+                eventRepo, vendorClient, objectMapper);
+        BackfillCheckpointRepository checkpointRepo = new BackfillCheckpointRepository(targetJdbc,
+                CHECKPOINT_LEASE_SECONDS);
+
+        String kafkaBootstrapServers = System.getenv().getOrDefault("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092");
+        Map<String, Object> producerProps = Map.of(
+                ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaBootstrapServers,
+                ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
+                ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+        producerFactory = new DefaultKafkaProducerFactory<>(producerProps);
+        kafkaTemplate = new KafkaTemplate<>(producerFactory);
+
+        coordinator = new BackfillCoordinator(sourceRepo, checkpointRepo, ledger, eventRepo, kafkaTemplate,
+                objectMapper, 1000L, TEST_VENDOR_BATCH_SIZE, TOPIC);
+        consumer = new BackfillConsumer(migrationService, ledger, objectMapper);
+    }
+
+    @AfterAll
+    static void disconnectAndResetVendor() {
+        try {
+            setVendorMode("healthy");
+        } finally {
+            if (producerFactory instanceof DefaultKafkaProducerFactory<String, String> factory) {
+                factory.destroy();
+            }
+            if (targetDataSource != null) {
+                targetDataSource.close();
+            }
+            if (sourceDataSource != null) {
+                sourceDataSource.close();
+            }
+            if (s3Client != null) {
+                s3Client.close();
+            }
+        }
+    }
+
+    @AfterEach
+    void cleanUpReservedRows() {
+        targetJdbc.update("DELETE FROM migration_event WHERE source_id >= ?", BASE_ID);
+        // The range-level QUEUED event carries a null source_id (it
+        // describes a whole range, not one file), so it is not covered
+        // by the source_id >= filter above and needs its own match on
+        // the range recorded in its detail.
+        targetJdbc.update("DELETE FROM migration_event WHERE source_id IS NULL "
+                + "AND detail->>'rangeStart' = ?", String.valueOf(BASE_ID));
+        targetJdbc.update("DELETE FROM document WHERE source_id >= ?", BASE_ID);
+        targetJdbc.update("DELETE FROM migration_state WHERE source_id >= ?", BASE_ID);
+        targetJdbc.update("DELETE FROM backfill_checkpoint WHERE range_start >= ?", BASE_ID);
+        sourceJdbc.update("DELETE FROM files WHERE id >= ?", BASE_ID);
+    }
+
+    @Test
+    void aClaimedRangeIsSeededPublishedConsumedAndReachesDoneWithDocumentsAndObjects() throws Exception {
+        long rangeStart = BASE_ID;
+        long rangeEnd = BASE_ID + 999;
+        List<Long> ids = List.of(BASE_ID + 1, BASE_ID + 2, BASE_ID + 3);
+        Map<Long, byte[]> contentById = Map.of(
+                ids.get(0), "INVOICE-A".getBytes(StandardCharsets.UTF_8),
+                ids.get(1), "INVOICE-B".getBytes(StandardCharsets.UTF_8),
+                ids.get(2), "INVOICE-C".getBytes(StandardCharsets.UTF_8));
+        for (Long id : ids) {
+            insertSourceFile(id, "invoice-" + id + ".txt", "text/plain", contentById.get(id));
+        }
+        // Simulate a range already claimed by an earlier claimNextRange()
+        // call, since claim-loop concurrency is proven separately.
+        targetJdbc.update("INSERT INTO backfill_checkpoint (range_start, range_end, status, claimed_at) "
+                + "VALUES (?, ?, 'CLAIMED', now())", rangeStart, rangeEnd);
+
+        // With a vendor batch size of 2 and 3 reserved ids, this must
+        // publish across two Kafka messages, not one, exercising the
+        // chunk boundary against a real broker.
+        coordinator.processRange(new BackfillRange(rangeStart, rangeEnd));
+
+        Map<String, Object> checkpointRow = targetJdbc.queryForMap(
+                "SELECT status FROM backfill_checkpoint WHERE range_start = ? AND range_end = ?",
+                rangeStart, rangeEnd);
+        assertEquals("DONE", checkpointRow.get("status"));
+
+        consumeUntilAllIdsSeen(new HashSet<>(ids), Duration.ofSeconds(60));
+
+        for (Long id : ids) {
+            Map<String, Object> state = targetJdbc.queryForMap(
+                    "SELECT status FROM migration_state WHERE source_id = ?", id);
+            assertEquals("DONE", state.get("status"), "id " + id + " must reach DONE");
+
+            byte[] stored = s3Client.getObject(GetObjectRequest.builder()
+                    .bucket(BUCKET)
+                    .key("files/" + id)
+                    .build()).readAllBytes();
+            assertTrue(java.util.Arrays.equals(contentById.get(id), stored),
+                    "the object written to MinIO for id " + id + " must match the source content");
+        }
+
+        Long documentCount = targetJdbc.queryForObject(
+                "SELECT count(*) FROM document WHERE source_id >= ? AND source_id <= ?", Long.class,
+                rangeStart, rangeEnd);
+        assertEquals(3L, documentCount);
+
+        Long queuedEvents = targetJdbc.queryForObject(
+                "SELECT count(*) FROM migration_event WHERE stage = 'QUEUED' AND lane = 'backfill' "
+                        + "AND detail->>'rangeStart' = ?",
+                Long.class, String.valueOf(rangeStart));
+        assertEquals(1L, queuedEvents, "processing a range must record exactly one QUEUED range event");
+    }
+
+    /**
+     * Reads from the real topic with a fresh, uniquely named consumer
+     * group so this never picks up a stale committed offset from a
+     * previous run and never contends with the real worker's "backfill"
+     * group. The topic can carry unrelated messages from other runs of
+     * the system, so anything not naming one of the ids this test cares
+     * about is left alone rather than acknowledged.
+     */
+    private void consumeUntilAllIdsSeen(Set<Long> remaining, Duration timeout) throws Exception {
+        String kafkaBootstrapServers = System.getenv().getOrDefault("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092");
+        Map<String, Object> consumerProps = Map.of(
+                ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaBootstrapServers,
+                ConsumerConfig.GROUP_ID_CONFIG, "backfill-it-" + UUID.randomUUID(),
+                ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest",
+                ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class,
+                ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
+        try (KafkaConsumer<String, String> rawConsumer = new KafkaConsumer<>(consumerProps)) {
+            rawConsumer.subscribe(List.of(TOPIC));
+            Instant deadline = Instant.now().plus(timeout);
+            while (!remaining.isEmpty() && Instant.now().isBefore(deadline)) {
+                ConsumerRecords<String, String> records = rawConsumer.poll(Duration.ofSeconds(2));
+                for (ConsumerRecord<String, String> record : records) {
+                    BackfillMessage message = objectMapper.readValue(record.value(), BackfillMessage.class);
+                    boolean matches = message.sourceIds().stream().anyMatch(remaining::contains);
+                    if (matches) {
+                        consumer.consume(record.value(), () -> { });
+                        remaining.removeAll(message.sourceIds());
+                    }
+                }
+            }
+            assertTrue(remaining.isEmpty(), "not every published id was consumed within the timeout: " + remaining);
+        }
+    }
+
+    private void insertSourceFile(long id, String filename, String contentType, byte[] content) {
+        sourceJdbc.update("INSERT INTO files (id, filename, content_type, content, byte_size) "
+                + "VALUES (?, ?, ?, ?, ?)", id, filename, contentType, content, content.length);
+    }
+
+    private static void setVendorMode(String mode) {
+        vendorAdminClient.post().uri("/admin/mode").body(Map.of("mode", mode)).retrieve().toBodilessEntity();
+    }
+}
