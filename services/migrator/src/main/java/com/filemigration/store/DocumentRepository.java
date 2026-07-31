@@ -4,6 +4,8 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
 
+import java.util.List;
+
 /**
  * The document table: one row per migrated file, holding where its blob
  * landed in the target store and the OCR result attached to it. A source
@@ -46,5 +48,37 @@ public class DocumentRepository {
             String checksumSha256, String ocrText, double ocrConfidence, int ocrPageCount, String ocrVendorJobId) {
         targetJdbc.update(UPSERT_SQL, sourceId, filename, contentType, objectKey, byteSize, checksumSha256,
                 ocrText, ocrConfidence, ocrPageCount, ocrVendorJobId);
+    }
+
+    /**
+     * Total row count in document, used by the reconciler to compare
+     * against the source and ledger row counts.
+     */
+    public long countAll() {
+        Long result = targetJdbc.queryForObject("SELECT COUNT(*) FROM document", Long.class);
+        return result == null ? 0L : result;
+    }
+
+    /**
+     * One page of document rows ordered by source_id ascending, starting
+     * strictly after afterId. Used by the reconciler to walk the whole
+     * table in fixed-size pages rather than loading every row, and every
+     * blob it points at, into memory at once.
+     */
+    public List<DocumentRow> findPage(long afterId, int limit) {
+        return targetJdbc.query(
+                "SELECT source_id, checksum_sha256, ocr_text, object_key FROM document "
+                        + "WHERE source_id > ? ORDER BY source_id LIMIT ?",
+                (rs, rowNum) -> new DocumentRow(rs.getLong("source_id"), rs.getString("checksum_sha256"),
+                        rs.getString("ocr_text"), rs.getString("object_key")),
+                afterId, limit);
+    }
+
+    /**
+     * The subset of a document row the reconciler needs: enough to
+     * recompute and compare its checksum and OCR text against the source
+     * blob without pulling the whole row.
+     */
+    public record DocumentRow(long sourceId, String checksumSha256, String ocrText, String objectKey) {
     }
 }

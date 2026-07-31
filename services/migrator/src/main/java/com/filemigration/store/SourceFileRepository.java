@@ -66,6 +66,15 @@ public class SourceFileRepository {
         return result == null ? 0L : result;
     }
 
+    /**
+     * Total row count in the source table, used by the reconciler to
+     * compare against the ledger and document row counts.
+     */
+    public long countAll() {
+        Long result = sourceJdbc.queryForObject("SELECT COUNT(*) FROM files", Long.class);
+        return result == null ? 0L : result;
+    }
+
     private static Instant toInstant(Timestamp timestamp) {
         return timestamp == null ? null : timestamp.toInstant();
     }

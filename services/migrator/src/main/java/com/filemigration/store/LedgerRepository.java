@@ -392,4 +392,34 @@ public class LedgerRepository {
      */
     public record ExceededAttempt(long sourceId, int attempts, String lastError) {
     }
+
+    /**
+     * Total row count in migration_state, used by the reconciler to
+     * compare against the source and document row counts.
+     */
+    public long countAll() {
+        Long result = targetJdbc.queryForObject("SELECT COUNT(*) FROM migration_state", Long.class);
+        return result == null ? 0L : result;
+    }
+
+    /**
+     * Every id whose current status is FAILED_PERMANENT, with the error
+     * recorded on that row. Reads migration_state directly rather than
+     * migration_event: resetForUpdate can revive a FAILED_PERMANENT row
+     * back to PENDING, so a past DLQ event is not proof an id is still
+     * bad, only migration_state.status reflects whether it currently is.
+     */
+    public List<PermanentFailure> findPermanentFailures() {
+        return targetJdbc.query(
+                "SELECT source_id, last_error FROM migration_state WHERE status = ? ORDER BY source_id",
+                (rs, rowNum) -> new PermanentFailure(rs.getLong("source_id"), rs.getString("last_error")),
+                Status.FAILED_PERMANENT.name());
+    }
+
+    /**
+     * One id currently FAILED_PERMANENT, with the error last recorded
+     * against it.
+     */
+    public record PermanentFailure(long sourceId, String lastError) {
+    }
 }
