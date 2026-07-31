@@ -121,6 +121,43 @@ class CdcConsumerTest {
         assertEquals(1, vendorClient.callCount());
     }
 
+    /**
+     * THE UPDATE WEDGE. No source record exists for id 11, so every
+     * delivery of this update envelope fails the same structural way a
+     * create envelope for a missing row does. What this test is actually
+     * about is that a nack causes Kafka to redeliver the identical
+     * envelope, carrying the identical version, and resetForUpdate must
+     * never treat that redelivery as new work: if it reset
+     * consecutive_failures on every delivery the way it once did, this id
+     * could never reach the retry cap and would nack forever instead of
+     * ever reaching FAILED_PERMANENT. Calling consume() again with the
+     * exact same payload is what a real redelivery looks like from this
+     * consumer's point of view.
+     */
+    @Test
+    void repeatedDeliveryOfTheSameUpdateEnvelopeForAnIdWithNoMatchingSourceRowReachesFailedPermanentWithinTheCapInsteadOfNackingForever() {
+        String sameEnvelope = envelope("u", null, afterRow(11L));
+        boolean settled = false;
+
+        for (int delivery = 1; delivery <= MAX_RETRY_ATTEMPTS + 2; delivery++) {
+            RecordingAcknowledgment ack = new RecordingAcknowledgment();
+            consumer.consume(sameEnvelope, ack);
+            if (ack.acknowledged) {
+                settled = true;
+                break;
+            }
+            assertEquals(delivery, ledger.consecutiveFailuresOf(11L),
+                    "redelivery " + delivery + " of the identical update envelope must accumulate consecutive "
+                            + "failures rather than reset them back to zero, or this id could never reach the "
+                            + "retry cap and would nack forever");
+        }
+
+        assertTrue(settled, "the id must eventually be acknowledged once it reaches a terminal state, not nack "
+                + "forever");
+        assertEquals(Status.FAILED_PERMANENT, ledger.statusOf(11L));
+        assertEquals(1, eventRepo.countByStageAndId(Stage.DLQ, 11L));
+    }
+
     @Test
     void deleteEnvelopeReadsIdFromBeforeAndTombstonesAndDeletesTheObject() {
         ledger.presetState(4L, Status.DONE, null);

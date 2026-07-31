@@ -39,10 +39,10 @@ class FakeLedgerRepository extends LedgerRepository {
         presetState(id, Status.PENDING, null);
     }
 
-    void presetFailedRetryable(long id, int attempts, String lastError) {
+    void presetFailedRetryable(long id, int attempts, int consecutiveFailures, String lastError) {
         Row row = new Row(Status.FAILED_RETRYABLE, null);
         row.attempts = attempts;
-        row.consecutiveFailures = attempts;
+        row.consecutiveFailures = consecutiveFailures;
         row.lastError = lastError;
         rows.put(id, row);
     }
@@ -88,7 +88,15 @@ class FakeLedgerRepository extends LedgerRepository {
         row.status = Status.PENDING;
         row.ocrPayload = null;
         row.lastError = null;
-        row.consecutiveFailures = 0;
+        // Mirrors LedgerRepository: only a version that actually advances
+        // past what is already stored resets the budget. A redelivery of
+        // the same envelope carries the same version and must leave
+        // consecutiveFailures untouched, or a repeatedly failing update
+        // could never reach the retry cap.
+        if (version > row.sourceVersion) {
+            row.consecutiveFailures = 0;
+        }
+        row.sourceVersion = version;
     }
 
     @Override
@@ -200,6 +208,7 @@ class FakeLedgerRepository extends LedgerRepository {
         private String lastError;
         private int attempts;
         private int consecutiveFailures;
+        private long sourceVersion;
 
         private Row(Status status, String ocrPayload) {
             this.status = status;

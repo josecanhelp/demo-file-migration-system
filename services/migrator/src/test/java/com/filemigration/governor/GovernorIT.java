@@ -19,7 +19,9 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.kafka.config.KafkaListenerEndpointRegistry;
 import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.listener.MessageListenerContainer;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.web.client.RestClient;
 
@@ -47,13 +49,20 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * migrator.worker-concurrency is deliberately set higher than either lane's
  * single topic partition: a concurrency thread with no partition assigned
  * sits idle and never registers as paused the way MessageListenerContainer
- * reports it, which is exactly the configuration under which
- * BreakerListener once got stuck permanently paused (it only called
- * resume() when isContainerPaused() already read true, which an idle
- * thread never does). Running every test in this class under that
- * configuration is what lets a regression of that bug actually fail a
- * test here instead of only ever showing up in a live, manually driven
- * chaos run.
+ * .isContainerPaused() reports it (that flag needs every child thread to
+ * individually confirm it, which an idle thread never does), which is
+ * exactly the configuration under which BreakerListener once got stuck
+ * permanently paused, since it only called resume() when isContainerPaused()
+ * already read true. Running every test in this class under that
+ * configuration is what lets a regression of that bug actually fail a test
+ * here instead of only ever showing up in a live, manually driven chaos
+ * run. Assertions in this class that need to observe pause or resume
+ * happening use isPauseRequested() instead of isContainerPaused() for
+ * exactly that reason: pause()/resume() set it immediately and
+ * synchronously on every container, parent and child alike, regardless of
+ * whether a child has any partition assigned to actually act on it, so it
+ * is the one signal here that is never at the mercy of an idle thread's
+ * poll loop.
  *
  * Every id this test seeds uses its own reserved source id range, well
  * clear of every other IT's, and is removed after each test regardless of
@@ -118,6 +127,9 @@ class GovernorIT {
     private KafkaTemplate<String, String> kafkaTemplate;
 
     @Autowired
+    private KafkaListenerEndpointRegistry registry;
+
+    @Autowired
     private CircuitBreaker vendorCircuitBreaker;
 
     private static RestClient vendorAdminClient;
@@ -138,6 +150,9 @@ class GovernorIT {
         // or a paused container, behind for the next test to inherit.
         waitUntil(() -> vendorCircuitBreaker.getState() == CircuitBreaker.State.CLOSED, RECOVERY_TIMEOUT,
                 "the vendor circuit breaker never returned to CLOSED after resetting the vendor to healthy");
+        waitUntil(() -> registry.getListenerContainers().stream().noneMatch(MessageListenerContainer::isPauseRequested),
+                RECOVERY_TIMEOUT, "a Kafka listener container never had its pause request cleared after the "
+                        + "breaker closed");
 
         for (Long id : seededIds) {
             targetJdbc.update("DELETE FROM migration_event WHERE source_id = ?", id);
@@ -154,11 +169,12 @@ class GovernorIT {
     }
 
     /**
-     * The headline scenario: kill the vendor, watch the breaker trip,
-     * watch the backlog behind it grow instead of being dropped, restore
-     * the vendor, watch the breaker close, and watch every file reach
-     * DONE with zero loss and zero files wrongly condemned to
-     * FAILED_PERMANENT along the way.
+     * The headline scenario: kill the vendor, watch the breaker trip and
+     * both listener containers actually get told to pause while the
+     * backlog behind them grows instead of being dropped, restore the
+     * vendor, watch the breaker close, the containers get told to resume,
+     * and every file reach DONE with zero loss and zero files wrongly
+     * condemned to FAILED_PERMANENT along the way.
      */
     @Test
     void breakerOpensOnOutagePausesBothLanesThenClosesAndDrainsWithZeroLoss() throws Exception {
@@ -170,12 +186,17 @@ class GovernorIT {
 
         waitUntil(() -> vendorCircuitBreaker.getState() == CircuitBreaker.State.OPEN, DETECTION_TIMEOUT,
                 "the vendor circuit breaker never opened after the vendor went down");
+        waitUntil(() -> registry.getListenerContainers().stream().allMatch(MessageListenerContainer::isPauseRequested),
+                DETECTION_TIMEOUT, "not every Kafka listener container was actually told to pause after the "
+                        + "breaker opened");
         assertTrue(countEvents("BREAKER_OPEN") > breakerOpenEventsBefore,
                 "a BREAKER_OPEN event must be recorded for this outage specifically, not merely have existed "
                         + "already from some earlier run");
 
         // Simulate the backlog continuing to arrive while the vendor is
-        // down.
+        // down: these ids are published only after both containers are
+        // already confirmed told to pause, so nothing has any chance to
+        // consume them before the lag measurement below.
         List<Long> extraIds = seedBackfillFiles(5, 100);
         int extraChunkSize = 2;
         long expectedExtraMessages = (extraIds.size() + extraChunkSize - 1) / extraChunkSize;
@@ -190,9 +211,9 @@ class GovernorIT {
         // extraIds is chunked into expectedExtraMessages messages, so that
         // is the growth this asserts on, not the raw id count.
         assertTrue(lagAfterPublishingMore >= lagBeforeWait + expectedExtraMessages,
-                "consumer lag must grow while the vendor is down, since a message that cannot be processed must "
-                        + "never be acknowledged and dropped; before=" + lagBeforeWait + " after="
-                        + lagAfterPublishingMore + " expectedExtraMessages=" + expectedExtraMessages);
+                "consumer lag must grow while paused, since a paused container fetches nothing to consume or "
+                        + "drop; before=" + lagBeforeWait + " after=" + lagAfterPublishingMore
+                        + " expectedExtraMessages=" + expectedExtraMessages);
 
         assertEquals(0, countStatus(allIds, "FAILED_PERMANENT"),
                 "no id may be condemned to FAILED_PERMANENT purely because of a vendor outage");
@@ -202,6 +223,8 @@ class GovernorIT {
 
         waitUntil(() -> vendorCircuitBreaker.getState() == CircuitBreaker.State.CLOSED, RECOVERY_TIMEOUT,
                 "the vendor circuit breaker never closed once the vendor recovered");
+        waitUntil(() -> registry.getListenerContainers().stream().noneMatch(MessageListenerContainer::isPauseRequested),
+                RECOVERY_TIMEOUT, "the Kafka listener containers were never told to resume once the breaker closed");
         assertTrue(countEvents("BREAKER_CLOSED") > breakerClosedEventsBefore,
                 "a BREAKER_CLOSED event must be recorded for this recovery specifically");
 
@@ -361,6 +384,43 @@ class GovernorIT {
         waitUntil(() -> "FAILED_PERMANENT".equals(statusOf(id)), DETECTION_TIMEOUT,
                 "source_id " + id + " never reached FAILED_PERMANENT; it would otherwise nack forever and block "
                         + "every other change queued behind it on the same partition");
+        assertEquals(1, countEventsForId(id, "DLQ"));
+        Integer consecutiveFailures = targetJdbc.queryForObject(
+                "SELECT consecutive_failures FROM migration_state WHERE source_id = ?", Integer.class, id);
+        assertTrue(consecutiveFailures >= 3, "the id must have actually been retried up to the configured cap, "
+                + "not condemned on the first attempt: consecutive_failures=" + consecutiveFailures);
+    }
+
+    /**
+     * THE UPDATE WEDGE, the same class of defect as THE WEDGE above, but
+     * for an op=u envelope rather than op=c. No source row exists for this
+     * id, so every delivery of this single update envelope fails the same
+     * structural way; a nack causes Kafka to redeliver the identical
+     * envelope, carrying the identical version, and CdcConsumer resets
+     * this row back to PENDING via resetForUpdate before every one of
+     * those redeliveries is migrated again. Before this fix,
+     * resetForUpdate cleared consecutive_failures unconditionally on every
+     * one of those redeliveries, so this id could never accumulate enough
+     * consecutive failures to reach the cap and would nack forever instead
+     * of ever reaching FAILED_PERMANENT, even though the cap's own PENDING
+     * branch exists specifically to catch a row reset by an update. A
+     * single publish is enough here; CdcConsumer's own nack-and-retry loop
+     * is what supplies the repeated redelivery.
+     */
+    @Test
+    void wedgeUpdateEnvelopeWithNoMatchingSourceRowReachesFailedPermanentWithinTheRetryCapInsteadOfNackingForever() {
+        long id = BASE_ID + 970;
+        seededIds.add(id);
+        // Deliberately no insertSourceFile(id, ...): mirrors a source row
+        // already gone by the time this update envelope is processed.
+
+        publishCdcUpdateEnvelope(id, 1);
+
+        waitUntil(() -> "FAILED_PERMANENT".equals(statusOf(id)), DETECTION_TIMEOUT,
+                "source_id " + id + " never reached FAILED_PERMANENT; an update envelope for a row with no "
+                        + "matching source id is redelivered with the same version on every nack, and would "
+                        + "otherwise nack forever instead of ever accumulating enough consecutive failures to "
+                        + "reach the cap");
         assertEquals(1, countEventsForId(id, "DLQ"));
         Integer consecutiveFailures = targetJdbc.queryForObject(
                 "SELECT consecutive_failures FROM migration_state WHERE source_id = ?", Integer.class, id);

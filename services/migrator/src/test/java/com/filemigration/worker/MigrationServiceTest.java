@@ -243,7 +243,14 @@ class MigrationServiceTest {
 
     @Test
     void idAtTheRetryCapIsMovedToFailedPermanentWithADlqEventInsteadOfBeingReclaimed() {
-        ledger.presetFailedRetryable(7001L, MAX_RETRY_ATTEMPTS, "source record no longer exists for a claimed id");
+        // attempts is deliberately set far above the cap and consecutive
+        // failures is set to exactly the cap, so this only condemns the id
+        // if the cap actually reads consecutiveFailures; a cap that
+        // mistakenly read attempts would also condemn it here, but for the
+        // wrong reason, which idUnderTheRetryCapIsStillReclaimedAndCanStillReachDone
+        // below is what catches.
+        ledger.presetFailedRetryable(7001L, MAX_RETRY_ATTEMPTS + 20, MAX_RETRY_ATTEMPTS,
+                "source record no longer exists for a claimed id");
 
         MigrationOutcome outcome = service.migrate(List.of(7001L), "cdc");
 
@@ -261,7 +268,11 @@ class MigrationServiceTest {
     void idUnderTheRetryCapIsStillReclaimedAndCanStillReachDone() {
         sourceRepo.put(new FileRecord(7002L, "retry.txt", "text/plain",
                 "content".getBytes(StandardCharsets.UTF_8), 7, Instant.now()));
-        ledger.presetFailedRetryable(7002L, MAX_RETRY_ATTEMPTS - 1, "vendor blip");
+        // attempts is deliberately set far above the cap while consecutive
+        // failures is kept one under it, proving a high lifetime attempts
+        // count alone must never condemn a file the cap actually reads
+        // consecutiveFailures for.
+        ledger.presetFailedRetryable(7002L, MAX_RETRY_ATTEMPTS + 20, MAX_RETRY_ATTEMPTS - 1, "vendor blip");
 
         MigrationOutcome outcome = service.migrate(List.of(7002L), "cdc");
 

@@ -364,6 +364,38 @@ class LedgerRepositoryIT {
         assertEquals(0, row.get("consecutive_failures"));
     }
 
+    /**
+     * The wedge this class's own name refers to elsewhere in this project:
+     * a nack causes Kafka to redeliver the identical update envelope,
+     * carrying the identical version, so resetForUpdate must not treat
+     * that redelivery as new work. Only a version that actually advances
+     * past what is already stored may clear consecutive_failures; the
+     * same version again must leave it untouched, or a repeatedly failing
+     * update could never climb to the retry cap.
+     */
+    @Test
+    void resetForUpdateOnlyClearsConsecutiveFailuresWhenTheVersionActuallyAdvances() {
+        long id = BASE_ID + 64;
+        insertState(id, "cdc", "FAILED_RETRYABLE", 6, 2);
+        jdbcTemplate.update("UPDATE migration_state SET source_version = ? WHERE source_id = ?", 100L, id);
+
+        // A redelivery of the same envelope carries the same version.
+        ledger.resetForUpdate(id, 100L);
+        Map<String, Object> afterSameVersion = jdbcTemplate.queryForMap(
+                "SELECT status, consecutive_failures FROM migration_state WHERE source_id = ?", id);
+        assertEquals("PENDING", afterSameVersion.get("status"));
+        assertEquals(2, afterSameVersion.get("consecutive_failures"),
+                "redelivery of the same update, carrying the same version, must never reset "
+                        + "consecutive_failures");
+
+        // A genuinely new update actually advances the version.
+        ledger.resetForUpdate(id, 101L);
+        assertEquals(0, jdbcTemplate.queryForObject(
+                "SELECT consecutive_failures FROM migration_state WHERE source_id = ?", Integer.class, id),
+                "a version that actually advances past what was stored must reset consecutive_failures, "
+                        + "granting a fresh budget for genuinely new work");
+    }
+
     @Test
     void markDoneClearsConsecutiveFailuresOnSuccess() {
         long id = BASE_ID + 60;

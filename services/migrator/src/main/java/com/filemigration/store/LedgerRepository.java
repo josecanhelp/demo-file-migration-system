@@ -155,10 +155,15 @@ public class LedgerRepository {
      * id dodge this cap indefinitely if update envelopes for it kept
      * arriving: consecutive_failures keeps whatever value it already had,
      * but the status this method matches on never sits at FAILED_RETRYABLE
-     * long enough to be caught. resetForUpdate itself always clears
-     * consecutive_failures back to zero, so a row only ever reaches this
-     * check as PENDING with a nonzero count if something inserted it that
-     * way directly (a test) rather than through the normal update path.
+     * long enough to be caught. This branch is not merely a defensive
+     * fallback: {@link #resetForUpdate} only clears consecutive_failures
+     * when the incoming version actually advances past what is already
+     * stored, so a redelivery of the same failing update envelope, which
+     * is exactly what a nack produces, carries the same version every
+     * time and leaves the row PENDING with its count intact. This check is
+     * what eventually condemns that row once the count reaches the cap,
+     * the same as it would for a FAILED_RETRYABLE row that never got
+     * reset at all.
      */
     public List<ExceededAttempt> failExceededAttempts(List<Long> ids, int maxConsecutiveFailures) {
         if (ids == null || ids.isEmpty()) {
@@ -342,15 +347,28 @@ public class LedgerRepository {
      * Puts a file back to PENDING after its source row changed, bumping
      * its version and dropping any cached OCR result, since that result
      * describes content that no longer matches what is in the source
-     * table. Also clears consecutive_failures: an update is new work, and
-     * whatever run of failures the row had before this content changed
-     * says nothing about whether the new content will fail the same way.
+     * table. consecutive_failures is cleared only when version actually
+     * advances past whatever is already stored in source_version, never
+     * unconditionally: a genuinely new update is new work, and whatever
+     * run of failures the row had before this content changed says
+     * nothing about whether the new content will fail the same way, so
+     * that case does get a fresh budget. But CdcConsumer nacks a failing
+     * envelope rather than dropping it, and Kafka redelivers the identical
+     * message, carrying the identical version, until it is finally
+     * acknowledged; resetting on every one of those redeliveries would
+     * hold consecutive_failures at zero or one forever and the row could
+     * never reach {@link #failExceededAttempts}'s cap no matter how many
+     * times the same update fails, nacking forever instead of ever
+     * reaching FAILED_PERMANENT. Comparing against the stored version
+     * before overwriting it is what tells a redelivery of the same
+     * envelope apart from an actually new one.
      */
     public void resetForUpdate(long id, long version) {
         targetJdbc.update(
-                "UPDATE migration_state SET status = ?, source_version = ?, ocr_payload = NULL, "
-                        + "last_error = NULL, consecutive_failures = 0, updated_at = now() WHERE source_id = ?",
-                Status.PENDING.name(), version, id);
+                "UPDATE migration_state SET status = ?, source_version = ?, ocr_payload = NULL, last_error = NULL, "
+                        + "consecutive_failures = CASE WHEN ? > source_version THEN 0 ELSE consecutive_failures END, "
+                        + "updated_at = now() WHERE source_id = ?",
+                Status.PENDING.name(), version, version, id);
     }
 
     /**
