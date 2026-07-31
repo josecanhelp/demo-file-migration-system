@@ -191,6 +191,9 @@ services:
       MINIO_REGION: us-east-1
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-8}
       DB_POOL_SIZE: ${DB_POOL_SIZE:-0}
+      VENDOR_BASE_URL: ${VENDOR_BASE_URL:-http://vendor-mock:8088}
+      VENDOR_CONNECT_TIMEOUT_MS: ${VENDOR_CONNECT_TIMEOUT_MS:-2000}
+      VENDOR_READ_TIMEOUT_MS: ${VENDOR_READ_TIMEOUT_MS:-10000}
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8082/actuator/health || exit 1"]
       interval: 5s
@@ -231,6 +234,9 @@ services:
       MINIO_REGION: us-east-1
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-8}
       DB_POOL_SIZE: ${DB_POOL_SIZE:-0}
+      VENDOR_BASE_URL: ${VENDOR_BASE_URL:-http://vendor-mock:8088}
+      VENDOR_CONNECT_TIMEOUT_MS: ${VENDOR_CONNECT_TIMEOUT_MS:-2000}
+      VENDOR_READ_TIMEOUT_MS: ${VENDOR_READ_TIMEOUT_MS:-10000}
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8081/actuator/health || exit 1"]
       interval: 5s

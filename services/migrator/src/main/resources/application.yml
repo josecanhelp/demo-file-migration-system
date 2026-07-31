@@ -26,6 +26,10 @@ migrator:
     secret-key: ${MINIO_SECRET_KEY:minioadmin}
     bucket: ${MINIO_BUCKET:documents}
     region: ${MINIO_REGION:us-east-1}
+  vendor:
+    base-url: ${VENDOR_BASE_URL:http://vendor-mock:8088}
+    connect-timeout-ms: ${VENDOR_CONNECT_TIMEOUT_MS:2000}
+    read-timeout-ms: ${VENDOR_READ_TIMEOUT_MS:10000}
 
 management:
   endpoints:
