@@ -12,6 +12,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Exercises Governor's retry policy and its circuit breaker wiring in
@@ -77,20 +78,36 @@ class GovernorTest {
         assertEquals(3, calls.get(), "every configured attempt must be spent before giving up");
     }
 
+    /**
+     * baseBackoffMs is set to 3000, far longer than retryAfter's 100ms: if
+     * this ever waited the exponential backoff curve instead of
+     * VendorException.retryAfter(), the elapsed wait would be measured in
+     * seconds, not milliseconds. Measuring the actual wall-clock wait,
+     * rather than only the call count, is what a baseBackoffMs of 0 could
+     * never distinguish: both paths would look instantaneous.
+     */
     @Test
     void rateLimitedWaitsForRetryAfterRatherThanTheBackoffCurveThenSucceeds() {
-        Governor governor = newGovernor(defaultBreaker(), 2, 0);
+        Governor governor = newGovernor(defaultBreaker(), 2, 3_000);
         AtomicInteger calls = new AtomicInteger();
 
+        long startNanos = System.nanoTime();
         String result = governor.execute("backfill", () -> {
             if (calls.incrementAndGet() == 1) {
-                throw new VendorException(ErrorClass.RATE_LIMITED, Duration.ofMillis(20), "slow down");
+                throw new VendorException(ErrorClass.RATE_LIMITED, Duration.ofMillis(100), "slow down");
             }
             return "done";
         });
+        long elapsedMillis = Duration.ofNanos(System.nanoTime() - startNanos).toMillis();
 
         assertEquals("done", result);
         assertEquals(2, calls.get());
+        assertTrue(elapsedMillis >= 90,
+                "the wait must be at least roughly retryAfter's 100ms, not skip it entirely: was " + elapsedMillis
+                        + "ms");
+        assertTrue(elapsedMillis < 2_000,
+                "the wait must be nowhere near the 3000ms backoff curve, proving retryAfter was honored instead "
+                        + "of the curve: was " + elapsedMillis + "ms");
     }
 
     @Test

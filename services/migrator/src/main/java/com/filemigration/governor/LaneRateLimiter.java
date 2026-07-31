@@ -75,14 +75,29 @@ public class LaneRateLimiter implements AutoCloseable {
     }
 
     /**
-     * Answers immediately: true if lane both stayed under its own share and
-     * the combined ceiling still had room, false otherwise. Never blocks.
+     * Answers immediately: true if the combined ceiling had room and lane
+     * also stayed under its own share, false otherwise. Never blocks.
+     *
+     * Checks the shared permit first and the lane's own resilience4j
+     * RateLimiter second, never the reverse, because only the shared
+     * permit can be given back: a Semaphore permit taken here and not
+     * used is returned by {@link Semaphore#release()} below, but a
+     * resilience4j RateLimiter has no equivalent way to hand a permit
+     * back once acquirePermission() has granted one. Checking the lane
+     * limiter first would burn one of its permits on every shared-pool
+     * miss with no way to undo it, letting a lane blocked only by the
+     * shared ceiling exhaust its own reserve while it waits, for no
+     * throughput ever actually gained.
      */
     public boolean tryAcquire(String lane) {
-        if (!limiterFor(lane).acquirePermission()) {
+        if (!sharedPermits.tryAcquire()) {
             return false;
         }
-        return sharedPermits.tryAcquire();
+        if (!limiterFor(lane).acquirePermission()) {
+            sharedPermits.release();
+            return false;
+        }
+        return true;
     }
 
     /**

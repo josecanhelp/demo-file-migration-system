@@ -80,9 +80,14 @@ public class BreakerListener {
      * paused the one time this was driven through worker-concurrency
      * greater than one against a live broker: pause() had genuinely been
      * called, but resume() was then skipped forever because
-     * isContainerPaused() never read true. resume() on an already-running
-     * container is documented as a no-op, so calling it unconditionally
-     * here is always safe.
+     * isContainerPaused() never read true.
+     *
+     * Calling resume() on a container that was never paused is a
+     * documented no-op. It is not equally harmless if something else in
+     * this process ever pauses a container for its own reason, an
+     * operator-initiated pause, for one: this method has no way to tell
+     * that pause apart from one it caused itself, and will resume it too.
+     * Nothing in this codebase does that yet.
      */
     private void resumeListeners(String reason) {
         int count = 0;

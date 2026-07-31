@@ -47,7 +47,9 @@ class LaneRateLimiterTest {
         for (int i = 0; i < 20; i++) assertTrue(limiter.tryAcquire("cdc"));
         assertFalse(limiter.tryAcquire("cdc"),
                 "the shared ceiling of 100 must cut cdc off here even though cdc's own limiter allows up to 100");
-        assertFalse(limiter.tryAcquire("backfill"), "backfill must already be capped at its own 80-permit share");
+        assertFalse(limiter.tryAcquire("backfill"),
+                "the shared ceiling of 100 (backfill's 80 plus cdc's 20) is exhausted here, on top of backfill's "
+                        + "own 80-permit share also already being at its cap");
     }
 
     @Test
@@ -56,6 +58,8 @@ class LaneRateLimiterTest {
         for (int i = 0; i < 80; i++) assertTrue(limiter.tryAcquire("cdc"));
 
         for (int i = 0; i < 20; i++) assertTrue(limiter.tryAcquire("backfill"));
-        assertFalse(limiter.tryAcquire("backfill"), "backfill's own 80-permit share is exhausted by this point");
+        assertFalse(limiter.tryAcquire("backfill"),
+                "backfill's own 80-permit limiter has only granted 20 so far and is nowhere near its cap; the "
+                        + "shared ceiling of 100 (cdc's 80 plus backfill's own 20) is the only thing blocking it here");
     }
 }

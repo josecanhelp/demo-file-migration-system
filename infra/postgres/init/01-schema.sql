@@ -13,16 +13,17 @@ CREATE TABLE document (
 );
 
 CREATE TABLE migration_state (
-  source_id         BIGINT PRIMARY KEY,
-  lane              TEXT NOT NULL,
-  status            TEXT NOT NULL,
-  attempts          INT  NOT NULL DEFAULT 0,
-  source_version    BIGINT NOT NULL DEFAULT 0,
-  source_created_at TIMESTAMPTZ,
-  checksum_sha256   TEXT,
-  ocr_payload       JSONB,
-  last_error        TEXT,
-  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+  source_id            BIGINT PRIMARY KEY,
+  lane                 TEXT NOT NULL,
+  status               TEXT NOT NULL,
+  attempts             INT  NOT NULL DEFAULT 0,
+  consecutive_failures INT  NOT NULL DEFAULT 0,
+  source_version       BIGINT NOT NULL DEFAULT 0,
+  source_created_at    TIMESTAMPTZ,
+  checksum_sha256      TEXT,
+  ocr_payload          JSONB,
+  last_error           TEXT,
+  updated_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX idx_state_status ON migration_state (status);
 CREATE INDEX idx_state_lane_status ON migration_state (lane, status);

@@ -66,7 +66,7 @@ public class MigrationService {
     private final Governor governor;
     private final ObjectMapper objectMapper;
     private final Duration claimRenewInterval;
-    private final int maxRetryAttempts;
+    private final int maxConsecutiveFailures;
     private final ScheduledExecutorService renewalExecutor;
 
     public MigrationService(LedgerRepository ledger, SourceFileRepository sourceRepo, ObjectStore objectStore,
@@ -74,7 +74,7 @@ public class MigrationService {
             Governor governor, ObjectMapper objectMapper,
             @Value("${migrator.claim-renew-interval-seconds}") long claimRenewIntervalSeconds,
             @Value("${migrator.worker-concurrency}") int workerConcurrency,
-            @Value("${migrator.max-retry-attempts}") int maxRetryAttempts) {
+            @Value("${migrator.max-retry-attempts}") int maxConsecutiveFailures) {
         this.ledger = ledger;
         this.sourceRepo = sourceRepo;
         this.objectStore = objectStore;
@@ -84,7 +84,7 @@ public class MigrationService {
         this.governor = governor;
         this.objectMapper = objectMapper;
         this.claimRenewInterval = Duration.ofSeconds(claimRenewIntervalSeconds);
-        this.maxRetryAttempts = maxRetryAttempts;
+        this.maxConsecutiveFailures = maxConsecutiveFailures;
         this.renewalExecutor = Executors.newScheduledThreadPool(Math.max(2, workerConcurrency), runnable -> {
             Thread thread = new Thread(runnable, "claim-renewer");
             thread.setDaemon(true);
@@ -106,16 +106,20 @@ public class MigrationService {
      * attempt: done + skipped + permanentFailures + retryable always adds
      * up to the number of ids passed in.
      *
-     * Before claiming anything, whichever given id is FAILED_RETRYABLE and
-     * has already used up every attempt it is allowed is moved straight to
-     * FAILED_PERMANENT and dead-lettered instead: claim() itself would
-     * otherwise reclaim it unconditionally forever, which is exactly how a
-     * single id with no way to ever succeed, for example one whose source
-     * row is permanently gone, ends up nacking forever and blocking every
-     * other id queued behind it on the same partition.
+     * Before claiming anything, whichever given id is PENDING or
+     * FAILED_RETRYABLE and has already run up consecutive_failures past the
+     * cap is moved straight to FAILED_PERMANENT and dead-lettered instead:
+     * claim() itself would otherwise reclaim it unconditionally forever,
+     * which is exactly how a single id with no way to ever succeed, for
+     * example one whose source row is permanently gone, ends up nacking
+     * forever and blocking every other id queued behind it on the same
+     * partition. A vendor TRANSIENT or RATE_LIMITED failure never counts
+     * toward that cap (see markRetryable's callers below), so a vendor
+     * outage, however long, is never what trips it.
      */
     public MigrationOutcome migrate(List<Long> sourceIds, String lane) {
-        List<LedgerRepository.ExceededAttempt> exceeded = ledger.failExceededAttempts(sourceIds, maxRetryAttempts);
+        List<LedgerRepository.ExceededAttempt> exceeded =
+                ledger.failExceededAttempts(sourceIds, maxConsecutiveFailures);
         for (LedgerRepository.ExceededAttempt id : exceeded) {
             deadLetter(id.sourceId(), lane, "MAX_RETRY_ATTEMPTS_EXCEEDED", id.attempts(), id.lastError());
         }
@@ -168,8 +172,10 @@ public class MigrationService {
             for (Long id : cachedIds) {
                 FileRecord record = recordsById.get(id);
                 if (record == null) {
+                    // Structural: no amount of retrying fixes a source row
+                    // that is gone, so this counts toward the retry cap.
                     markRetryable(id, "Source record no longer exists for a claimed id with a cached OCR payload",
-                            lane);
+                            lane, true);
                     retryable++;
                     continue;
                 }
@@ -182,7 +188,8 @@ public class MigrationService {
             for (Long id : needsOcr) {
                 FileRecord record = recordsById.get(id);
                 if (record == null) {
-                    markRetryable(id, "Source record no longer exists for a claimed id", lane);
+                    // Structural, same reasoning as above.
+                    markRetryable(id, "Source record no longer exists for a claimed id", lane, true);
                     retryable++;
                     continue;
                 }
@@ -204,8 +211,12 @@ public class MigrationService {
                         }
                         return new MigrationOutcome(done, skipped, permanentFailures, retryable);
                     }
+                    // TRANSIENT or RATE_LIMITED: a vendor availability
+                    // problem the circuit breaker and pausing already
+                    // protect against, never a reason on its own to move
+                    // an id closer to FAILED_PERMANENT.
                     for (FileRecord record : freshRecords) {
-                        markRetryable(record.id(), e.getMessage(), lane);
+                        markRetryable(record.id(), e.getMessage(), lane, false);
                     }
                     throw e;
                 }
@@ -213,7 +224,11 @@ public class MigrationService {
                 for (FileRecord record : freshRecords) {
                     OcrResult result = results.get(record.id());
                     if (result == null) {
-                        markRetryable(record.id(), "Vendor response did not include a result for this id", lane);
+                        // The vendor answered but its response omitted
+                        // this id, a mismatch retrying is unlikely to fix
+                        // on its own, so this counts toward the cap.
+                        markRetryable(record.id(), "Vendor response did not include a result for this id", lane,
+                                true);
                         retryable++;
                         continue;
                     }
@@ -254,7 +269,7 @@ public class MigrationService {
     private IsolationResult isolatePermanentFailure(List<FileRecord> freshRecords, String lane) {
         if (freshRecords.size() == 1) {
             FileRecord record = freshRecords.get(0);
-            ledger.markFailed(record.id(), "Vendor rejected this file", true);
+            ledger.markFailed(record.id(), "Vendor rejected this file", true, false);
             deadLetter(record.id(), lane, ErrorClass.PERMANENT.name(), ledger.attemptsOf(record.id()),
                     "Vendor rejected this file");
             return new IsolationResult(0, 1, 0, null);
@@ -270,13 +285,16 @@ public class MigrationService {
                 singleResult = governor.execute(lane, () -> vendorClient.ocrBatch(List.of(record)));
             } catch (VendorException individual) {
                 if (individual.errorClass() != ErrorClass.PERMANENT) {
+                    // TRANSIENT or RATE_LIMITED on an isolating retry is
+                    // still a vendor availability problem, not a reason to
+                    // move any of these ids closer to FAILED_PERMANENT.
                     for (int j = i; j < freshRecords.size(); j++) {
-                        markRetryable(freshRecords.get(j).id(), individual.getMessage(), lane);
+                        markRetryable(freshRecords.get(j).id(), individual.getMessage(), lane, false);
                         retryable++;
                     }
                     return new IsolationResult(done, permanentFailures, retryable, individual);
                 }
-                ledger.markFailed(record.id(), individual.getMessage(), true);
+                ledger.markFailed(record.id(), individual.getMessage(), true, false);
                 deadLetter(record.id(), lane, ErrorClass.PERMANENT.name(), ledger.attemptsOf(record.id()),
                         individual.getMessage());
                 permanentFailures++;
@@ -284,7 +302,7 @@ public class MigrationService {
             }
             OcrResult result = singleResult.get(record.id());
             if (result == null) {
-                markRetryable(record.id(), "Vendor response did not include a result for this id", lane);
+                markRetryable(record.id(), "Vendor response did not include a result for this id", lane, true);
                 retryable++;
                 continue;
             }
@@ -296,8 +314,16 @@ public class MigrationService {
         return new IsolationResult(done, permanentFailures, retryable, null);
     }
 
-    private void markRetryable(long id, String message, String lane) {
-        ledger.markFailed(id, message, false);
+    /**
+     * Marks an id retryable. countsTowardRetryCap must be true only for a
+     * structural failure retrying can never fix on its own (the source row
+     * is gone, the vendor's response omitted this id) and false for a
+     * vendor TRANSIENT or RATE_LIMITED failure, so that only the former
+     * can ever move an id toward FAILED_PERMANENT through
+     * {@link LedgerRepository#failExceededAttempts}.
+     */
+    private void markRetryable(long id, String message, String lane, boolean countsTowardRetryCap) {
+        ledger.markFailed(id, message, false, countsTowardRetryCap);
         eventRepo.record(id, Stage.RETRY, lane, null);
     }
 

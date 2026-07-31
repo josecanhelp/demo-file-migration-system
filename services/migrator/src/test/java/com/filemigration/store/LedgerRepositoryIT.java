@@ -241,15 +241,19 @@ class LedgerRepositoryIT {
     void failExceededAttemptsMovesAtCapRowsToFailedPermanentAndPreservesLastErrorAndLeavesOthersAlone() {
         long atCap = BASE_ID + 50;
         long underCap = BASE_ID + 51;
-        insertState(atCap, "cdc", "FAILED_RETRYABLE", 5);
-        insertState(underCap, "cdc", "FAILED_RETRYABLE", 4);
+        // Lifetime attempts is deliberately different from, and larger
+        // than, consecutive_failures on both rows, to prove the cap reads
+        // the latter, never the former.
+        insertState(atCap, "cdc", "FAILED_RETRYABLE", 10, 5);
+        insertState(underCap, "cdc", "FAILED_RETRYABLE", 8, 4);
         jdbcTemplate.update("UPDATE migration_state SET last_error = ? WHERE source_id = ?", "boom", atCap);
 
         List<LedgerRepository.ExceededAttempt> exceeded = ledger.failExceededAttempts(List.of(atCap, underCap), 5);
 
         assertEquals(1, exceeded.size());
         assertEquals(atCap, exceeded.get(0).sourceId());
-        assertEquals(5, exceeded.get(0).attempts());
+        assertEquals(10, exceeded.get(0).attempts(), "the returned attempts value is the lifetime diagnostic "
+                + "count, not the consecutive-failures count that actually gated this");
         assertEquals("boom", exceeded.get(0).lastError());
         assertEquals("FAILED_PERMANENT", jdbcTemplate.queryForObject(
                 "SELECT status FROM migration_state WHERE source_id = ?", String.class, atCap));
@@ -257,12 +261,33 @@ class LedgerRepositoryIT {
                 "SELECT status FROM migration_state WHERE source_id = ?", String.class, underCap));
     }
 
+    /**
+     * The critical case: a row can have a lifetime attempts count past any
+     * reasonable cap purely from ordinary successful reclaims (a file
+     * claimed once to backfill it, then reclaimed on four more legitimate
+     * updates, none of which ever failed) and must never be condemned,
+     * because the cap reads consecutive_failures, which stayed at zero
+     * the whole time.
+     */
+    @Test
+    void failExceededAttemptsNeverCondemnsARowWithZeroConsecutiveFailuresNoMatterHowHighLifetimeAttemptsIs() {
+        long id = BASE_ID + 58;
+        insertState(id, "backfill", "PENDING", 10, 0);
+
+        List<LedgerRepository.ExceededAttempt> exceeded = ledger.failExceededAttempts(List.of(id), 5);
+
+        assertTrue(exceeded.isEmpty(), "zero consecutive failures must never be condemned regardless of "
+                + "lifetime attempts");
+        assertEquals("PENDING", jdbcTemplate.queryForObject(
+                "SELECT status FROM migration_state WHERE source_id = ?", String.class, id));
+    }
+
     @Test
     void failExceededAttemptsLeavesInFlightAndOcrDoneRowsAlone() {
         long inFlight = BASE_ID + 54;
         long ocrDone = BASE_ID + 56;
-        insertState(inFlight, "cdc", "IN_FLIGHT", 6);
-        insertState(ocrDone, "cdc", "OCR_DONE", 6);
+        insertState(inFlight, "cdc", "IN_FLIGHT", 6, 6);
+        insertState(ocrDone, "cdc", "OCR_DONE", 6, 6);
 
         List<LedgerRepository.ExceededAttempt> exceeded = ledger.failExceededAttempts(
                 List.of(inFlight, ocrDone), 5);
@@ -272,18 +297,18 @@ class LedgerRepositoryIT {
     }
 
     /**
-     * resetForUpdate forces a row back to PENDING before CdcConsumer
-     * migrates an updated envelope again, so a PENDING row can carry
-     * exactly the same accumulated attempts count a FAILED_RETRYABLE one
-     * would. Without also matching PENDING here, an id whose updates keep
-     * getting replayed could climb past maxAttempts indefinitely, since
-     * its status would never sit at FAILED_RETRYABLE long enough for this
-     * method to ever see it.
+     * In the ordinary CdcConsumer flow, resetForUpdate always clears
+     * consecutive_failures back to zero before a row can ever reach this
+     * check as PENDING (see resetForUpdateClearsConsecutiveFailures
+     * below), so a PENDING row only ever reaches this method with a
+     * nonzero consecutive_failures count through a path other than the
+     * normal update flow. This proves the SQL condition itself still
+     * catches that case defensively, whatever puts a row in it.
      */
     @Test
-    void failExceededAttemptsAlsoCatchesAPendingRowResetByAnUpdateWithAttemptsAlreadyAtTheCap() {
+    void failExceededAttemptsCatchesAPendingRowWithConsecutiveFailuresAtTheCap() {
         long pending = BASE_ID + 53;
-        insertState(pending, "cdc", "PENDING", 5);
+        insertState(pending, "cdc", "PENDING", 5, 5);
 
         List<LedgerRepository.ExceededAttempt> exceeded = ledger.failExceededAttempts(List.of(pending), 5);
 
@@ -296,7 +321,7 @@ class LedgerRepositoryIT {
     @Test
     void failExceededAttemptsLeavesAPendingRowUnderTheCapAlone() {
         long pending = BASE_ID + 57;
-        insertState(pending, "cdc", "PENDING", 2);
+        insertState(pending, "cdc", "PENDING", 2, 2);
 
         List<LedgerRepository.ExceededAttempt> exceeded = ledger.failExceededAttempts(List.of(pending), 5);
 
@@ -308,7 +333,7 @@ class LedgerRepositoryIT {
     @Test
     void claimNoLongerReclaimsAnIdAlreadyMovedToFailedPermanentByTheRetryCap() {
         long id = BASE_ID + 52;
-        insertState(id, "cdc", "FAILED_RETRYABLE", 5);
+        insertState(id, "cdc", "FAILED_RETRYABLE", 5, 5);
         ledger.failExceededAttempts(List.of(id), 5);
 
         List<Long> claimed = ledger.claim(List.of(id));
@@ -320,10 +345,53 @@ class LedgerRepositoryIT {
     @Test
     void attemptsOfReturnsTheCurrentAttemptsCountOrZeroForAnUnknownId() {
         long id = BASE_ID + 55;
-        insertState(id, "cdc", "FAILED_RETRYABLE", 3);
+        insertState(id, "cdc", "FAILED_RETRYABLE", 3, 3);
 
         assertEquals(3, ledger.attemptsOf(id));
         assertEquals(0, ledger.attemptsOf(id + 1_000_000));
+    }
+
+    @Test
+    void resetForUpdateClearsConsecutiveFailuresSinceAnUpdateIsNewWork() {
+        long id = BASE_ID + 59;
+        insertState(id, "cdc", "FAILED_RETRYABLE", 6, 4);
+
+        ledger.resetForUpdate(id, 99L);
+
+        Map<String, Object> row = jdbcTemplate.queryForMap(
+                "SELECT status, consecutive_failures FROM migration_state WHERE source_id = ?", id);
+        assertEquals("PENDING", row.get("status"));
+        assertEquals(0, row.get("consecutive_failures"));
+    }
+
+    @Test
+    void markDoneClearsConsecutiveFailuresOnSuccess() {
+        long id = BASE_ID + 60;
+        insertState(id, "backfill", "IN_FLIGHT", 4, 3);
+
+        ledger.markDone(id, "checksum");
+
+        assertEquals(0, jdbcTemplate.queryForObject(
+                "SELECT consecutive_failures FROM migration_state WHERE source_id = ?", Integer.class, id));
+    }
+
+    @Test
+    void markFailedIncrementsConsecutiveFailuresOnlyWhenItCountsTowardTheRetryCap() {
+        long structural = BASE_ID + 61;
+        long vendorOutage = BASE_ID + 62;
+        insertState(structural, "cdc", "IN_FLIGHT", 1, 0);
+        insertState(vendorOutage, "cdc", "IN_FLIGHT", 1, 0);
+
+        ledger.markFailed(structural, "source row gone", false, true);
+        ledger.markFailed(vendorOutage, "vendor down", false, false);
+
+        assertEquals(1, jdbcTemplate.queryForObject(
+                "SELECT consecutive_failures FROM migration_state WHERE source_id = ?", Integer.class, structural),
+                "a structural failure retrying can never fix must increment consecutive_failures");
+        assertEquals(0, jdbcTemplate.queryForObject(
+                "SELECT consecutive_failures FROM migration_state WHERE source_id = ?", Integer.class, vendorOutage),
+                "a vendor TRANSIENT/RATE_LIMITED failure must never increment consecutive_failures; the "
+                        + "breaker and pausing already protect that case");
     }
 
     @Test
@@ -389,6 +457,13 @@ class LedgerRepositoryIT {
         jdbcTemplate.update(
                 "INSERT INTO migration_state (source_id, lane, status, attempts) VALUES (?, ?, ?, ?)",
                 sourceId, lane, status, attempts);
+    }
+
+    private void insertState(long sourceId, String lane, String status, int attempts, int consecutiveFailures) {
+        jdbcTemplate.update(
+                "INSERT INTO migration_state (source_id, lane, status, attempts, consecutive_failures) "
+                        + "VALUES (?, ?, ?, ?, ?)",
+                sourceId, lane, status, attempts, consecutiveFailures);
     }
 
     private static List<Long> sorted(List<Long> ids) {

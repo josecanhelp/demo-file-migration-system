@@ -127,24 +127,40 @@ public class LedgerRepository {
 
     /**
      * Moves whichever of the given ids is PENDING or FAILED_RETRYABLE with
-     * attempts already at or past maxAttempts straight to FAILED_PERMANENT,
-     * without touching last_error: the message already there is the real
-     * reason this id keeps failing, and overwriting it with "exceeded max
-     * attempts" would throw that reason away right when a caller most
-     * needs it for a dead-letter record. Must run before {@link #claim},
-     * since claim's own WHERE clause reclaims a PENDING or FAILED_RETRYABLE
-     * row unconditionally; calling this first is what stops an id from
-     * being retried forever once it has already used up every attempt it
-     * is allowed.
+     * consecutive_failures already at or past the cap straight to
+     * FAILED_PERMANENT, without touching last_error: the message already
+     * there is the real reason this id keeps failing, and overwriting it
+     * with "exceeded max attempts" would throw that reason away right when
+     * a caller most needs it for a dead-letter record. Must run before
+     * {@link #claim}, since claim's own WHERE clause reclaims a PENDING or
+     * FAILED_RETRYABLE row unconditionally; calling this first is what
+     * stops an id from being retried forever once it has already used up
+     * every consecutive failure it is allowed.
+     *
+     * Gates on consecutive_failures, never on the lifetime attempts
+     * column: attempts increments on every claim regardless of outcome,
+     * including a file that keeps getting legitimately updated and
+     * succeeding, or an id reclaimed repeatedly while the vendor circuit
+     * breaker is flapping open and closed during an outage. Neither of
+     * those is a reason to ever condemn a file. consecutive_failures only
+     * increments for a failure that retrying can never fix on its own (for
+     * example the source row is gone) and is reset on every success and by
+     * {@link #resetForUpdate}, so only a run of that specific kind of
+     * failure, never ordinary lifetime activity or vendor unavailability,
+     * can trip this cap.
      *
      * PENDING is included, not only FAILED_RETRYABLE, because
      * {@link #resetForUpdate} forces a row back to PENDING before an
      * updated CDC envelope is migrated again, which would otherwise let an
-     * id dodge this cap indefinitely: attempts keeps climbing on every
-     * claim, but the status this method matches on never sits at
-     * FAILED_RETRYABLE long enough to be caught.
+     * id dodge this cap indefinitely if update envelopes for it kept
+     * arriving: consecutive_failures keeps whatever value it already had,
+     * but the status this method matches on never sits at FAILED_RETRYABLE
+     * long enough to be caught. resetForUpdate itself always clears
+     * consecutive_failures back to zero, so a row only ever reaches this
+     * check as PENDING with a nonzero count if something inserted it that
+     * way directly (a test) rather than through the normal update path.
      */
-    public List<ExceededAttempt> failExceededAttempts(List<Long> ids, int maxAttempts) {
+    public List<ExceededAttempt> failExceededAttempts(List<Long> ids, int maxConsecutiveFailures) {
         if (ids == null || ids.isEmpty()) {
             return Collections.emptyList();
         }
@@ -153,13 +169,13 @@ public class LedgerRepository {
                 + "   SET status = 'FAILED_PERMANENT', updated_at = now()\n"
                 + " WHERE source_id = ANY(?)\n"
                 + "   AND status IN ('PENDING', 'FAILED_RETRYABLE')\n"
-                + "   AND attempts >= ?\n"
+                + "   AND consecutive_failures >= ?\n"
                 + "RETURNING source_id, attempts, last_error";
         return targetJdbc.execute((ConnectionCallback<List<ExceededAttempt>>) connection -> {
             Array sqlArray = connection.createArrayOf("bigint", idArray);
             try (PreparedStatement ps = connection.prepareStatement(sql)) {
                 ps.setArray(1, sqlArray);
-                ps.setInt(2, maxAttempts);
+                ps.setInt(2, maxConsecutiveFailures);
                 try (ResultSet rs = ps.executeQuery()) {
                     List<ExceededAttempt> exceeded = new ArrayList<>();
                     while (rs.next()) {
@@ -173,11 +189,13 @@ public class LedgerRepository {
     }
 
     /**
-     * The current attempts count for one id, used only to enrich a
-     * dead-letter record with how many times this id was attempted before
-     * the failure that finally sent it to FAILED_PERMANENT. Returns 0 for
-     * an id with no row rather than failing, since a caller building a
-     * best-effort dead-letter record should not itself fail over this.
+     * The current lifetime attempts count for one id, used only to enrich
+     * a dead-letter record with how many times this id was ever claimed
+     * before the failure that finally sent it to FAILED_PERMANENT. This is
+     * the lifetime counter, not the consecutive-failures count the retry
+     * cap itself reads. Returns 0 for an id with no row rather than
+     * failing, since a caller building a best-effort dead-letter record
+     * should not itself fail over this.
      */
     public int attemptsOf(long id) {
         List<Integer> attempts = targetJdbc.queryForList(
@@ -274,47 +292,64 @@ public class LedgerRepository {
     /**
      * Stores the vendor OCR result for a claimed file and marks it
      * OCR_DONE, so a crash after this point does not pay for OCR again.
+     * Clears consecutive_failures, since a vendor call that actually
+     * returned a result for this id is forward progress, not a failure.
      */
     public void saveOcrPayload(long id, String json) {
         targetJdbc.update(
-                "UPDATE migration_state SET ocr_payload = ?::jsonb, status = ?, updated_at = now() "
-                        + "WHERE source_id = ?",
+                "UPDATE migration_state SET ocr_payload = ?::jsonb, status = ?, "
+                        + "consecutive_failures = 0, updated_at = now() WHERE source_id = ?",
                 json, Status.OCR_DONE.name(), id);
     }
 
     /**
      * Marks a file fully migrated, recording the checksum of the blob that
-     * was written to the target store.
+     * was written to the target store, and clears consecutive_failures:
+     * whatever run of failures this id may have had before, reaching DONE
+     * is unambiguous success.
      */
     public void markDone(long id, String checksum) {
         targetJdbc.update(
-                "UPDATE migration_state SET status = ?, checksum_sha256 = ?, updated_at = now() "
-                        + "WHERE source_id = ?",
+                "UPDATE migration_state SET status = ?, checksum_sha256 = ?, "
+                        + "consecutive_failures = 0, updated_at = now() WHERE source_id = ?",
                 Status.DONE.name(), checksum, id);
     }
 
     /**
      * Marks a file failed, retryable or permanent depending on the error
-     * classification the caller already made.
+     * classification the caller already made. countsTowardRetryCap decides
+     * whether this failure increments consecutive_failures, the counter
+     * {@link #failExceededAttempts} reads: the caller should pass true
+     * only for a failure that retrying can never fix on its own (the
+     * source row is gone, the vendor's response omitted this id), and
+     * false for a vendor TRANSIENT or RATE_LIMITED failure, since the
+     * circuit breaker and pausing already protect that case and a vendor
+     * outage, however long, must never condemn a file through this
+     * counter climbing on its own. Ignored when permanent is true, since a
+     * permanent failure is already terminal and the cap has nothing left
+     * to decide.
      */
-    public void markFailed(long id, String error, boolean permanent) {
+    public void markFailed(long id, String error, boolean permanent, boolean countsTowardRetryCap) {
         Status status = permanent ? Status.FAILED_PERMANENT : Status.FAILED_RETRYABLE;
-        targetJdbc.update(
-                "UPDATE migration_state SET status = ?, last_error = ?, updated_at = now() "
-                        + "WHERE source_id = ?",
-                status.name(), error, id);
+        String sql = !permanent && countsTowardRetryCap
+                ? "UPDATE migration_state SET status = ?, last_error = ?, "
+                        + "consecutive_failures = consecutive_failures + 1, updated_at = now() WHERE source_id = ?"
+                : "UPDATE migration_state SET status = ?, last_error = ?, updated_at = now() WHERE source_id = ?";
+        targetJdbc.update(sql, status.name(), error, id);
     }
 
     /**
      * Puts a file back to PENDING after its source row changed, bumping
      * its version and dropping any cached OCR result, since that result
      * describes content that no longer matches what is in the source
-     * table.
+     * table. Also clears consecutive_failures: an update is new work, and
+     * whatever run of failures the row had before this content changed
+     * says nothing about whether the new content will fail the same way.
      */
     public void resetForUpdate(long id, long version) {
         targetJdbc.update(
                 "UPDATE migration_state SET status = ?, source_version = ?, ocr_payload = NULL, "
-                        + "last_error = NULL, updated_at = now() WHERE source_id = ?",
+                        + "last_error = NULL, consecutive_failures = 0, updated_at = now() WHERE source_id = ?",
                 Status.PENDING.name(), version, id);
     }
 

@@ -22,12 +22,24 @@ import java.time.Duration;
  * minimum low on purpose, since what this breaker is protecting against is
  * a vendor outage, which shows up as a run of TRANSIENT failures in short
  * order, not as a slow trend across hundreds of calls.
+ *
+ * permittedNumberOfCallsInHalfOpenState is lowered to 1 for the same
+ * reason: resilience4j's own default of 10 never evaluates HALF_OPEN at
+ * all until 10 calls actually happen while it is open, and recovery from
+ * a real outage can easily arrive as only one or two in-flight messages
+ * rather than ten, which would otherwise leave the breaker stuck in
+ * HALF_OPEN indefinitely, resumed but never formally confirmed closed,
+ * for lack of enough traffic to ever finish evaluating. A single
+ * successful trial call is treated as enough evidence to close; any
+ * subsequent failure is caught by the same minimumNumberOfCalls and
+ * slidingWindowSize evaluation CLOSED already uses.
  */
 @Configuration
 public class GovernorConfig {
 
     private static final int SLIDING_WINDOW_SIZE = 10;
     private static final int MINIMUM_NUMBER_OF_CALLS = 5;
+    private static final int PERMITTED_CALLS_IN_HALF_OPEN_STATE = 1;
 
     @Bean
     public CircuitBreaker vendorCircuitBreaker(
@@ -39,6 +51,7 @@ public class GovernorConfig {
                 .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.COUNT_BASED)
                 .slidingWindowSize(SLIDING_WINDOW_SIZE)
                 .minimumNumberOfCalls(MINIMUM_NUMBER_OF_CALLS)
+                .permittedNumberOfCallsInHalfOpenState(PERMITTED_CALLS_IN_HALF_OPEN_STATE)
                 .recordException(GovernorConfig::isTransientVendorFailure)
                 // BreakerListener pauses every listener container while
                 // OPEN, so nothing would ever call the vendor again to let

@@ -42,8 +42,14 @@ class FakeLedgerRepository extends LedgerRepository {
     void presetFailedRetryable(long id, int attempts, String lastError) {
         Row row = new Row(Status.FAILED_RETRYABLE, null);
         row.attempts = attempts;
+        row.consecutiveFailures = attempts;
         row.lastError = lastError;
         rows.put(id, row);
+    }
+
+    int consecutiveFailuresOf(long id) {
+        Row row = rows.get(id);
+        return row == null ? 0 : row.consecutiveFailures;
     }
 
     void throwOnNextFindUnresolved(RuntimeException exception) {
@@ -82,6 +88,7 @@ class FakeLedgerRepository extends LedgerRepository {
         row.status = Status.PENDING;
         row.ocrPayload = null;
         row.lastError = null;
+        row.consecutiveFailures = 0;
     }
 
     @Override
@@ -90,12 +97,12 @@ class FakeLedgerRepository extends LedgerRepository {
     }
 
     @Override
-    public List<ExceededAttempt> failExceededAttempts(List<Long> ids, int maxAttempts) {
+    public List<ExceededAttempt> failExceededAttempts(List<Long> ids, int maxConsecutiveFailures) {
         List<ExceededAttempt> exceeded = new ArrayList<>();
         for (Long id : ids) {
             Row row = rows.get(id);
             boolean candidate = row != null && (row.status == Status.PENDING || row.status == Status.FAILED_RETRYABLE);
-            if (candidate && row.attempts >= maxAttempts) {
+            if (candidate && row.consecutiveFailures >= maxConsecutiveFailures) {
                 row.status = Status.FAILED_PERMANENT;
                 exceeded.add(new ExceededAttempt(id, row.attempts, row.lastError));
             }
@@ -141,6 +148,7 @@ class FakeLedgerRepository extends LedgerRepository {
         Row row = rows.computeIfAbsent(id, unused -> new Row(Status.IN_FLIGHT, null));
         row.ocrPayload = json;
         row.status = Status.OCR_DONE;
+        row.consecutiveFailures = 0;
     }
 
     @Override
@@ -148,13 +156,17 @@ class FakeLedgerRepository extends LedgerRepository {
         Row row = rows.computeIfAbsent(id, unused -> new Row(Status.IN_FLIGHT, null));
         row.status = Status.DONE;
         row.checksum = checksum;
+        row.consecutiveFailures = 0;
     }
 
     @Override
-    public void markFailed(long id, String error, boolean permanent) {
+    public void markFailed(long id, String error, boolean permanent, boolean countsTowardRetryCap) {
         Row row = rows.computeIfAbsent(id, unused -> new Row(Status.IN_FLIGHT, null));
         row.status = permanent ? Status.FAILED_PERMANENT : Status.FAILED_RETRYABLE;
         row.lastError = error;
+        if (!permanent && countsTowardRetryCap) {
+            row.consecutiveFailures++;
+        }
     }
 
     @Override
@@ -187,6 +199,7 @@ class FakeLedgerRepository extends LedgerRepository {
         private String checksum;
         private String lastError;
         private int attempts;
+        private int consecutiveFailures;
 
         private Row(Status status, String ocrPayload) {
             this.status = status;
