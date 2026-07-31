@@ -108,6 +108,29 @@ services:
       retries: 20
       start_period: 30s
 
+  # Fake vendor OCR API with chaos controls. Long-running and part of a plain
+  # `docker compose up`, since migration workers depend on it being reachable.
+  # POST /admin/mode flips it into a failure mode at runtime to exercise the
+  # circuit breaker; the starting mode comes from VENDOR_FAILURE_MODE.
+  vendor-mock:
+    build: ./services/vendor-mock
+    container_name: vendor-mock
+    restart: unless-stopped
+    ports:
+      - "8088:8088"
+    environment:
+      PORT: 8088
+      VENDOR_RATE_LIMIT_RPS: ${VENDOR_RATE_LIMIT_RPS:-50}
+      VENDOR_BATCH_SIZE: ${VENDOR_BATCH_SIZE:-25}
+      VENDOR_LATENCY_MS: ${VENDOR_LATENCY_MS:-150}
+      VENDOR_FAILURE_MODE: ${VENDOR_FAILURE_MODE:-healthy}
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:8088/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
   # Populates sourcedb.files with synthetic documents. Not part of a plain
   # `docker compose up`: it lives in the tools profile and is invoked with
   # `docker compose run --rm seeder` once mysql is ready.
