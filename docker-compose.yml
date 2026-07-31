@@ -1,0 +1,115 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: sourcedb
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./infra/mysql/conf:/etc/mysql/conf.d
+      - ./infra/mysql/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  postgres:
+    image: postgres:16
+    container_name: postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: targetdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d targetdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
+  # One-shot bucket setup. Runs mc against minio, creates the documents
+  # bucket, then exits. Lets a fresh `docker compose up` skip any manual
+  # bucket creation step.
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin &&
+      mc mb -p local/documents &&
+      exit 0
+      "
+
+  # Single-broker Kafka in KRaft mode (no Zookeeper). Dual listeners: PLAINTEXT
+  # on the compose network for other services (kafka:9092), PLAINTEXT_HOST
+  # mapped to the host port for anything connecting from outside the
+  # compose network (localhost:9092).
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: kafka
+    restart: unless-stopped
+    ports:
+      - "9092:29092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+volumes:
+  mysql-data:
+  postgres-data:
+  minio-data:
+  kafka-data:
