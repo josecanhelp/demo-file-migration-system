@@ -96,12 +96,16 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * simply passed over rather than blocking anything.
  *
  * Every poll loop below polls at least once before it ever looks at its
- * own success condition, so a condition that happens to already be true
- * (for example because the live container's own "cdc" group got there
- * first) can never make this test's own consumer look like it did
- * something it did not: this test's own consume() call for a given id's
- * envelope is what the ack/nack assertions below examine, not a guess
- * about who produced the database row this test can also see.
+ * own success condition, so this test's own CdcConsumer instance always
+ * gets at least one chance to act on a message before anything is
+ * asserted about it. What the ack/nack assertions below examine is
+ * strictly this consumer's own ack/nack decision, recorded at the moment
+ * it made it; that is a fact this test can state honestly regardless of
+ * who wins any given claim. Which of the two consumers actually finishes
+ * a row, the live container's "cdc" group or this test's own instance,
+ * is a separate question the exit condition on each poll loop answers by
+ * reading the database, not something the ack/nack assertions claim to
+ * settle.
  *
  * Every row this test writes uses a filename carrying the "cdcit-" prefix
  * and is removed after each test by the exact id MySQL assigned it, never
@@ -359,17 +363,23 @@ class CdcIT {
      * assertions that follow checking a stale or absent recording instead
      * of this call's own outcome.
      *
-     * Every id this call has already seen a nack for is replayed against
-     * its own stored payload on each pass, the same effect a real nack
-     * has in production: the live container's "cdc" group consumes the
-     * same real topic this test does, under its own group id, so it can
-     * legitimately win the race to claim a row this test also just
-     * inserted, in which case this test's own attempt correctly nacks
-     * (the row is not yet DONE from where this attempt is standing) while
-     * the live container finishes it. Replaying converges the recording
-     * this test asserts on to the truth once the row settles, rather than
-     * asserting on whichever side happened to lose an ordinary claim
-     * race.
+     * Every id this test itself created that has already seen a nack is
+     * replayed against its own stored payload on each pass, the same
+     * effect a real nack has in production: the live container's "cdc"
+     * group consumes the same real topic this test does, under its own
+     * group id, so it can legitimately win the race to claim a row this
+     * test also just inserted, in which case this test's own attempt
+     * correctly nacks (the row is not yet DONE from where this attempt is
+     * standing) while the live container finishes it. Replaying converges
+     * the recording this test asserts on to the truth once the row
+     * settles, rather than asserting on whichever side happened to lose
+     * an ordinary claim race. Only this test's own ids are ever replayed:
+     * the topic also carries other suites' changes, including at least
+     * one every run that never resolves (a row another suite deletes
+     * before its own create envelope is read back), and replaying one of
+     * those would re-seed and re-record a migration_state/migration_event
+     * row for an id this test does not own and its own cleanup does not
+     * know to remove.
      */
     private void driveConsumptionUntil(BooleanSupplier condition, Duration timeout, String timeoutMessage) {
         Instant deadline = Instant.now().plus(timeout);
@@ -387,9 +397,10 @@ class CdcIT {
     }
 
     private void replayNackedPayloads() {
-        for (Map.Entry<Long, RecordingAcknowledgment> entry : new ArrayList<>(lastAckById.entrySet())) {
-            if (entry.getValue().nackedWith != null) {
-                String payload = lastPayloadById.get(entry.getKey());
+        for (Long id : insertedIds) {
+            RecordingAcknowledgment ack = lastAckById.get(id);
+            if (ack != null && ack.nackedWith != null) {
+                String payload = lastPayloadById.get(id);
                 if (payload != null) {
                     processRecord(payload);
                 }

@@ -34,6 +34,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.kafka.core.DefaultKafkaProducerFactory;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.core.ProducerFactory;
+import org.springframework.kafka.support.Acknowledgment;
 import org.springframework.web.client.RestClient;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
@@ -306,7 +307,24 @@ class BackfillIT {
                     BackfillMessage message = objectMapper.readValue(record.value(), BackfillMessage.class);
                     boolean matches = message.sourceIds().stream().anyMatch(remaining::contains);
                     if (matches) {
-                        consumer.consume(record.value(), () -> { });
+                        // A real Debezium connector also runs against this
+                        // same MySQL and the same shared target Postgres
+                        // now, so the CDC lane can legitimately win the
+                        // race to claim one of these ids before this call
+                        // does; when that happens BackfillConsumer finds it
+                        // still unresolved and nacks. The status assertions
+                        // below re-check the real database directly rather
+                        // than trusting this call finished the migration
+                        // itself, so nack only needs to not blow up here.
+                        consumer.consume(record.value(), new Acknowledgment() {
+                            @Override
+                            public void acknowledge() {
+                            }
+
+                            @Override
+                            public void nack(Duration sleep) {
+                            }
+                        });
                         remaining.removeAll(message.sourceIds());
                     }
                 }
