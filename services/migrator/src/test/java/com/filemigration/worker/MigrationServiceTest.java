@@ -7,6 +7,7 @@ import com.filemigration.model.Status;
 import com.filemigration.vendor.ErrorClass;
 import com.filemigration.vendor.OcrResult;
 import com.filemigration.vendor.VendorException;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -29,6 +30,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class MigrationServiceTest {
 
+    private static final long CLAIM_RENEW_INTERVAL_SECONDS = 10L;
+    private static final int WORKER_CONCURRENCY = 1;
+
     private FakeLedgerRepository ledger;
     private FakeSourceFileRepository sourceRepo;
     private FakeObjectStore objectStore;
@@ -46,7 +50,12 @@ class MigrationServiceTest {
         eventRepo = new FakeEventRepository();
         vendorClient = new FakeVendorClient();
         service = new MigrationService(ledger, sourceRepo, objectStore, documentRepo, eventRepo, vendorClient,
-                new ObjectMapper());
+                new ObjectMapper(), CLAIM_RENEW_INTERVAL_SECONDS, WORKER_CONCURRENCY);
+    }
+
+    @AfterEach
+    void tearDown() {
+        service.shutdown();
     }
 
     @Test

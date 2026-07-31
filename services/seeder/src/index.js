@@ -11,12 +11,43 @@ const SEED_FILE_COUNT = parseInt(process.env.SEED_FILE_COUNT || '500', 10);
 const SEED_FILE_SIZE_BYTES = parseInt(process.env.SEED_FILE_SIZE_BYTES || '2048', 10);
 const SEED_BATCH_SIZE = parseInt(process.env.SEED_BATCH_SIZE || '500', 10);
 const SEED_PROGRESS_LOG_INTERVAL = parseInt(process.env.SEED_PROGRESS_LOG_INTERVAL || '5000', 10);
+const SEED_CONNECT_RETRIES = parseInt(process.env.SEED_CONNECT_RETRIES || '30', 10);
+const SEED_CONNECT_RETRY_DELAY_MS = 1000;
 
 const MYSQL_HOST = process.env.MYSQL_HOST || 'mysql';
 const MYSQL_PORT = parseInt(process.env.MYSQL_PORT || '3306', 10);
 const MYSQL_USER = process.env.MYSQL_USER || 'root';
 const MYSQL_PASSWORD = process.env.MYSQL_PASSWORD || 'root';
 const MYSQL_DATABASE = process.env.MYSQL_DATABASE || 'sourcedb';
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// A healthy container does not guarantee the server is actually ready to
+// accept a real connection the instant it reports healthy, so this tries
+// up to SEED_CONNECT_RETRIES times, a second apart, before giving up.
+async function connectWithRetry() {
+  let lastError;
+  for (let attempt = 1; attempt <= SEED_CONNECT_RETRIES; attempt += 1) {
+    try {
+      return await mysql.createConnection({
+        host: MYSQL_HOST,
+        port: MYSQL_PORT,
+        user: MYSQL_USER,
+        password: MYSQL_PASSWORD,
+        database: MYSQL_DATABASE,
+      });
+    } catch (err) {
+      lastError = err;
+      console.log(
+        `connection attempt ${attempt}/${SEED_CONNECT_RETRIES} failed (${err.code || err.message}), retrying in 1s`
+      );
+      await delay(SEED_CONNECT_RETRY_DELAY_MS);
+    }
+  }
+  throw lastError;
+}
 
 // Inserts one multi-row statement for the given ids. Batched by the
 // caller so a single INSERT never spans the whole seed run.
@@ -32,13 +63,7 @@ async function insertBatch(connection, ids) {
 }
 
 async function main() {
-  const connection = await mysql.createConnection({
-    host: MYSQL_HOST,
-    port: MYSQL_PORT,
-    user: MYSQL_USER,
-    password: MYSQL_PASSWORD,
-    database: MYSQL_DATABASE,
-  });
+  const connection = await connectWithRetry();
 
   try {
     const [[{ currentCount, maxId }]] = await connection.query(

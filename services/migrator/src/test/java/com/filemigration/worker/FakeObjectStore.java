@@ -14,6 +14,7 @@ class FakeObjectStore extends ObjectStore {
 
     private final Map<String, byte[]> objects = new HashMap<>();
     private int putCount = 0;
+    private RuntimeException nextPutFailure;
 
     FakeObjectStore() {
         super(null, "documents");
@@ -23,6 +24,15 @@ class FakeObjectStore extends ObjectStore {
         return putCount;
     }
 
+    /**
+     * The very next call to put() throws this instead of storing
+     * anything, simulating an infrastructure problem (a Postgres or
+     * MinIO blip) unrelated to the vendor call.
+     */
+    void throwOnNextPut(RuntimeException exception) {
+        this.nextPutFailure = exception;
+    }
+
     @Override
     public byte[] get(String key) {
         return objects.get(key);
@@ -30,6 +40,11 @@ class FakeObjectStore extends ObjectStore {
 
     @Override
     public String put(String key, byte[] bytes, String contentType) {
+        if (nextPutFailure != null) {
+            RuntimeException toThrow = nextPutFailure;
+            nextPutFailure = null;
+            throw toThrow;
+        }
         objects.put(key, bytes);
         putCount++;
         return key;

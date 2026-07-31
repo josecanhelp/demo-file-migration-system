@@ -13,14 +13,23 @@ import com.filemigration.vendor.ErrorClass;
 import com.filemigration.vendor.OcrResult;
 import com.filemigration.vendor.VendorClient;
 import com.filemigration.vendor.VendorException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
+import jakarta.annotation.PreDestroy;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Carries a batch of source ids from the source database through to the
@@ -33,9 +42,19 @@ import java.util.Map;
  * returned outcome: done, skipped, permanently failed, or retryable.
  * Nothing is ever left unaccounted for, since an id left untouched would
  * stay IN_FLIGHT with no way for a later call to notice it needs help.
+ *
+ * For as long as a call is working through the ids it claimed, it renews
+ * only that exact set on a short interval, so the ledger's claim lease
+ * only has to outlast a brief gap between renewals rather than however
+ * long this whole call takes. Renewing is scoped strictly to the ids this
+ * call itself claimed, never to whatever ids the caller originally asked
+ * for: an id another, still-live attempt already owns is never touched
+ * here, so renewing never extends a claim this call does not hold.
  */
 @Service
 public class MigrationService {
+
+    private static final Logger log = LoggerFactory.getLogger(MigrationService.class);
 
     private final LedgerRepository ledger;
     private final SourceFileRepository sourceRepo;
@@ -44,10 +63,14 @@ public class MigrationService {
     private final EventRepository eventRepo;
     private final VendorClient vendorClient;
     private final ObjectMapper objectMapper;
+    private final Duration claimRenewInterval;
+    private final ScheduledExecutorService renewalExecutor;
 
     public MigrationService(LedgerRepository ledger, SourceFileRepository sourceRepo, ObjectStore objectStore,
             DocumentRepository documentRepo, EventRepository eventRepo, VendorClient vendorClient,
-            ObjectMapper objectMapper) {
+            ObjectMapper objectMapper,
+            @Value("${migrator.claim-renew-interval-seconds}") long claimRenewIntervalSeconds,
+            @Value("${migrator.worker-concurrency}") int workerConcurrency) {
         this.ledger = ledger;
         this.sourceRepo = sourceRepo;
         this.objectStore = objectStore;
@@ -55,6 +78,17 @@ public class MigrationService {
         this.eventRepo = eventRepo;
         this.vendorClient = vendorClient;
         this.objectMapper = objectMapper;
+        this.claimRenewInterval = Duration.ofSeconds(claimRenewIntervalSeconds);
+        this.renewalExecutor = Executors.newScheduledThreadPool(Math.max(2, workerConcurrency), runnable -> {
+            Thread thread = new Thread(runnable, "claim-renewer");
+            thread.setDaemon(true);
+            return thread;
+        });
+    }
+
+    @PreDestroy
+    public void shutdown() {
+        renewalExecutor.shutdownNow();
     }
 
     /**
@@ -72,93 +106,115 @@ public class MigrationService {
         if (claimed.isEmpty()) {
             return new MigrationOutcome(0, skipped, 0, 0);
         }
-        for (Long id : claimed) {
-            eventRepo.record(id, Stage.CLAIMED, lane, null);
-        }
 
-        Map<Long, String> cachedPayloads = ledger.findCachedOcrPayloads(claimed);
-        List<Long> cachedIds = new ArrayList<>();
-        List<Long> needsOcr = new ArrayList<>();
-        for (Long id : claimed) {
-            if (cachedPayloads.containsKey(id)) {
-                cachedIds.add(id);
-            } else {
-                needsOcr.add(id);
+        // Scheduled against claimed, and only claimed: an id from
+        // sourceIds that this call did not just claim is, by definition,
+        // still owned by someone else's live attempt or already done,
+        // and renewing it here would extend a claim this call has no
+        // right to extend.
+        ScheduledFuture<?> renewal = renewalExecutor.scheduleAtFixedRate(() -> renewClaims(claimed),
+                claimRenewInterval.toSeconds(), claimRenewInterval.toSeconds(), TimeUnit.SECONDS);
+        try {
+            for (Long id : claimed) {
+                eventRepo.record(id, Stage.CLAIMED, lane, null);
             }
-        }
 
-        // Metadata is fetched for every claimed id, cached or not, since
-        // the document row needs filename, content type, and a checksum
-        // of the current content regardless of whether OCR runs again
-        // this time.
-        Map<Long, FileRecord> recordsById = new HashMap<>();
-        for (FileRecord record : sourceRepo.findByIds(claimed)) {
-            recordsById.put(record.id(), record);
-        }
-
-        int done = 0;
-        int permanentFailures = 0;
-        int retryable = 0;
-
-        for (Long id : cachedIds) {
-            FileRecord record = recordsById.get(id);
-            if (record == null) {
-                markRetryable(id, "Source record no longer exists for a claimed id with a cached OCR payload", lane);
-                retryable++;
-                continue;
-            }
-            OcrResult cached = readOcrPayload(cachedPayloads.get(id));
-            finishDocument(record, cached, lane);
-            done++;
-        }
-
-        List<FileRecord> freshRecords = new ArrayList<>();
-        for (Long id : needsOcr) {
-            FileRecord record = recordsById.get(id);
-            if (record == null) {
-                markRetryable(id, "Source record no longer exists for a claimed id", lane);
-                retryable++;
-                continue;
-            }
-            freshRecords.add(record);
-        }
-
-        if (!freshRecords.isEmpty()) {
-            Map<Long, OcrResult> results;
-            try {
-                results = vendorClient.ocrBatch(freshRecords);
-            } catch (VendorException e) {
-                if (e.errorClass() == ErrorClass.PERMANENT) {
-                    IsolationResult isolation = isolatePermanentFailure(freshRecords, lane);
-                    done += isolation.done();
-                    permanentFailures += isolation.permanentFailures();
-                    retryable += isolation.retryable();
-                    if (isolation.toRethrow() != null) {
-                        throw isolation.toRethrow();
-                    }
-                    return new MigrationOutcome(done, skipped, permanentFailures, retryable);
+            Map<Long, String> cachedPayloads = ledger.findCachedOcrPayloads(claimed);
+            List<Long> cachedIds = new ArrayList<>();
+            List<Long> needsOcr = new ArrayList<>();
+            for (Long id : claimed) {
+                if (cachedPayloads.containsKey(id)) {
+                    cachedIds.add(id);
+                } else {
+                    needsOcr.add(id);
                 }
-                for (FileRecord record : freshRecords) {
-                    markRetryable(record.id(), e.getMessage(), lane);
-                }
-                throw e;
             }
 
-            for (FileRecord record : freshRecords) {
-                OcrResult result = results.get(record.id());
-                if (result == null) {
-                    markRetryable(record.id(), "Vendor response did not include a result for this id", lane);
+            // Metadata is fetched for every claimed id, cached or not,
+            // since the document row needs filename, content type, and a
+            // checksum of the current content regardless of whether OCR
+            // runs again this time.
+            Map<Long, FileRecord> recordsById = new HashMap<>();
+            for (FileRecord record : sourceRepo.findByIds(claimed)) {
+                recordsById.put(record.id(), record);
+            }
+
+            int done = 0;
+            int permanentFailures = 0;
+            int retryable = 0;
+
+            for (Long id : cachedIds) {
+                FileRecord record = recordsById.get(id);
+                if (record == null) {
+                    markRetryable(id, "Source record no longer exists for a claimed id with a cached OCR payload",
+                            lane);
                     retryable++;
                     continue;
                 }
-                ledger.saveOcrPayload(record.id(), writeOcrPayload(result));
-                eventRepo.record(record.id(), Stage.OCR_DONE, lane, null);
-                finishDocument(record, result, lane);
+                OcrResult cached = readOcrPayload(cachedPayloads.get(id));
+                finishDocument(record, cached, lane);
                 done++;
             }
-        }
 
-        return new MigrationOutcome(done, skipped, permanentFailures, retryable);
+            List<FileRecord> freshRecords = new ArrayList<>();
+            for (Long id : needsOcr) {
+                FileRecord record = recordsById.get(id);
+                if (record == null) {
+                    markRetryable(id, "Source record no longer exists for a claimed id", lane);
+                    retryable++;
+                    continue;
+                }
+                freshRecords.add(record);
+            }
+
+            if (!freshRecords.isEmpty()) {
+                Map<Long, OcrResult> results;
+                try {
+                    results = vendorClient.ocrBatch(freshRecords);
+                } catch (VendorException e) {
+                    if (e.errorClass() == ErrorClass.PERMANENT) {
+                        IsolationResult isolation = isolatePermanentFailure(freshRecords, lane);
+                        done += isolation.done();
+                        permanentFailures += isolation.permanentFailures();
+                        retryable += isolation.retryable();
+                        if (isolation.toRethrow() != null) {
+                            throw isolation.toRethrow();
+                        }
+                        return new MigrationOutcome(done, skipped, permanentFailures, retryable);
+                    }
+                    for (FileRecord record : freshRecords) {
+                        markRetryable(record.id(), e.getMessage(), lane);
+                    }
+                    throw e;
+                }
+
+                for (FileRecord record : freshRecords) {
+                    OcrResult result = results.get(record.id());
+                    if (result == null) {
+                        markRetryable(record.id(), "Vendor response did not include a result for this id", lane);
+                        retryable++;
+                        continue;
+                    }
+                    ledger.saveOcrPayload(record.id(), writeOcrPayload(result));
+                    eventRepo.record(record.id(), Stage.OCR_DONE, lane, null);
+                    finishDocument(record, result, lane);
+                    done++;
+                }
+            }
+
+            return new MigrationOutcome(done, skipped, permanentFailures, retryable);
+        } finally {
+            renewal.cancel(false);
+        }
+    }
+
+    private void renewClaims(List<Long> ids) {
+        try {
+            ledger.renewClaims(ids);
+        } catch (RuntimeException e) {
+            log.warn("Failed to renew the claim lease for {} id(s); it may expire and become reclaimable "
+                    + "while this call is still legitimately in progress", ids.size(), e);
+        }
     }
 
     /**

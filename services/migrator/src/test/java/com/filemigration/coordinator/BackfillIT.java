@@ -106,6 +106,7 @@ class BackfillIT {
     private static KafkaTemplate<String, String> kafkaTemplate;
     private static BackfillCoordinator coordinator;
     private static BackfillConsumer consumer;
+    private static MigrationService migrationService;
     private static ObjectMapper objectMapper;
 
     @BeforeAll
@@ -169,8 +170,8 @@ class BackfillIT {
         DocumentRepository documentRepo = new DocumentRepository(targetJdbc);
         EventRepository eventRepo = new EventRepository(targetJdbc);
         VendorClient vendorClient = new VendorClient(vendorRestClient, objectMapper);
-        MigrationService migrationService = new MigrationService(ledger, sourceRepo, objectStore, documentRepo,
-                eventRepo, vendorClient, objectMapper);
+        migrationService = new MigrationService(ledger, sourceRepo, objectStore, documentRepo,
+                eventRepo, vendorClient, objectMapper, CLAIM_RENEW_INTERVAL_SECONDS, WORKER_CONCURRENCY);
         BackfillCheckpointRepository checkpointRepo = new BackfillCheckpointRepository(targetJdbc,
                 CHECKPOINT_LEASE_SECONDS);
 
@@ -185,8 +186,7 @@ class BackfillIT {
 
         coordinator = new BackfillCoordinator(sourceRepo, checkpointRepo, ledger, eventRepo, kafkaTemplate,
                 objectMapper, 1000L, TEST_VENDOR_BATCH_SIZE, TOPIC, PLAN_INTERVAL_SECONDS);
-        consumer = new BackfillConsumer(migrationService, ledger, objectMapper, NACK_BACKOFF_SECONDS,
-                CLAIM_RENEW_INTERVAL_SECONDS, WORKER_CONCURRENCY);
+        consumer = new BackfillConsumer(migrationService, ledger, objectMapper, NACK_BACKOFF_SECONDS);
     }
 
     @AfterAll
@@ -194,6 +194,9 @@ class BackfillIT {
         try {
             setVendorMode("healthy");
         } finally {
+            if (migrationService != null) {
+                migrationService.shutdown();
+            }
             if (producerFactory instanceof DefaultKafkaProducerFactory<String, String> factory) {
                 factory.destroy();
             }

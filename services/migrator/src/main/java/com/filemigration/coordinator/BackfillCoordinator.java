@@ -172,8 +172,13 @@ public class BackfillCoordinator {
 
     private void publish(List<Long> ids) {
         String payload = writeMessage(ids);
+        // Keyed by the chunk's first id rather than left null: an
+        // unkeyed record lets Kafka's sticky partitioner land an entire
+        // burst of sends on the same partition, which would mean a
+        // stuck message blocks the whole lane instead of a share of it.
+        String key = String.valueOf(ids.get(0));
         try {
-            kafkaTemplate.send(topic, payload).get(PUBLISH_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            kafkaTemplate.send(topic, key, payload).get(PUBLISH_TIMEOUT_SECONDS, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IllegalStateException("Interrupted while publishing a backfill chunk to " + topic, e);

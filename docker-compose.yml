@@ -13,7 +13,13 @@ services:
       - ./infra/mysql/conf:/etc/mysql/conf.d
       - ./infra/mysql/init:/docker-entrypoint-initdb.d
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot"]
+      # -h 127.0.0.1 forces a real TCP connection on port 3306, unlike
+      # -h localhost, which mysqladmin resolves to the unix socket and
+      # which the entrypoint's temporary startup server answers on well
+      # before the real server is listening on TCP. Checking the socket
+      # alone lets service_healthy fire before anything can actually
+      # connect to the database over the network.
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-P", "3306", "-uroot", "-proot"]
       interval: 5s
       timeout: 5s
       retries: 20
@@ -139,6 +145,12 @@ services:
   seeder:
     build: ./services/seeder
     container_name: seeder
+    # Backstops the connect-retry loop inside the seeder itself: if MySQL
+    # was genuinely not ready yet despite passing its healthcheck, and the
+    # seeder's own retries still ran out, restarting the container gives
+    # it a fresh set of attempts rather than leaving migrator-coordinator
+    # gated forever on a service that already gave up.
+    restart: on-failure
     depends_on:
       mysql:
         condition: service_healthy
@@ -152,6 +164,7 @@ services:
       SEED_FILE_SIZE_BYTES: ${SEED_FILE_SIZE_BYTES:-2048}
       SEED_BATCH_SIZE: ${SEED_BATCH_SIZE:-500}
       SEED_PROGRESS_LOG_INTERVAL: ${SEED_PROGRESS_LOG_INTERVAL:-5000}
+      SEED_CONNECT_RETRIES: ${SEED_CONNECT_RETRIES:-30}
 
   # Migrator image, built once and run twice under different profiles. The
   # worker profile consumes the backfill topic and runs each batch of ids
@@ -245,6 +258,7 @@ services:
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-8}
       DB_POOL_SIZE: ${DB_POOL_SIZE:-0}
       CLAIM_LEASE_SECONDS: ${CLAIM_LEASE_SECONDS:-60}
+      CLAIM_RENEW_INTERVAL_SECONDS: ${CLAIM_RENEW_INTERVAL_SECONDS:-10}
       VENDOR_BASE_URL: ${VENDOR_BASE_URL:-http://vendor-mock:8088}
       VENDOR_CONNECT_TIMEOUT_MS: ${VENDOR_CONNECT_TIMEOUT_MS:-2000}
       VENDOR_READ_TIMEOUT_MS: ${VENDOR_READ_TIMEOUT_MS:-10000}

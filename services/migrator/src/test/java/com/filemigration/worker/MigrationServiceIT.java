@@ -55,6 +55,8 @@ class MigrationServiceIT {
     private static final long BASE_ID = 9_000_000L;
     private static final String BUCKET = "documents";
     private static final long LEASE_SECONDS = 300L;
+    private static final long CLAIM_RENEW_INTERVAL_SECONDS = 10L;
+    private static final int WORKER_CONCURRENCY = 1;
 
     private static HikariDataSource targetDataSource;
     private static HikariDataSource sourceDataSource;
@@ -126,7 +128,7 @@ class MigrationServiceIT {
         EventRepository eventRepo = new EventRepository(targetJdbc);
         VendorClient vendorClient = new VendorClient(vendorRestClient, objectMapper);
         service = new MigrationService(ledger, sourceRepo, objectStore, documentRepo, eventRepo, vendorClient,
-                objectMapper);
+                objectMapper, CLAIM_RENEW_INTERVAL_SECONDS, WORKER_CONCURRENCY);
     }
 
     @AfterAll
@@ -134,6 +136,9 @@ class MigrationServiceIT {
         try {
             setVendorMode("healthy");
         } finally {
+            if (service != null) {
+                service.shutdown();
+            }
             if (targetDataSource != null) {
                 targetDataSource.close();
             }

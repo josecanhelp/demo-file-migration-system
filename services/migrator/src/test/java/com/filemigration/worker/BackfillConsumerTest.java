@@ -7,6 +7,7 @@ import com.filemigration.model.FileRecord;
 import com.filemigration.model.Status;
 import com.filemigration.vendor.ErrorClass;
 import com.filemigration.vendor.VendorException;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.kafka.support.Acknowledgment;
@@ -39,6 +40,8 @@ class BackfillConsumerTest {
     private FakeLedgerRepository ledger;
     private FakeSourceFileRepository sourceRepo;
     private FakeVendorClient vendorClient;
+    private FakeObjectStore objectStore;
+    private MigrationService migrationService;
     private BackfillConsumer consumer;
 
     @BeforeEach
@@ -46,10 +49,16 @@ class BackfillConsumerTest {
         ledger = new FakeLedgerRepository();
         sourceRepo = new FakeSourceFileRepository();
         vendorClient = new FakeVendorClient();
-        MigrationService migrationService = new MigrationService(ledger, sourceRepo, new FakeObjectStore(),
-                new FakeDocumentRepository(), new FakeEventRepository(), vendorClient, OBJECT_MAPPER);
-        consumer = new BackfillConsumer(migrationService, ledger, OBJECT_MAPPER, NACK_BACKOFF_SECONDS,
+        objectStore = new FakeObjectStore();
+        migrationService = new MigrationService(ledger, sourceRepo, objectStore,
+                new FakeDocumentRepository(), new FakeEventRepository(), vendorClient, OBJECT_MAPPER,
                 CLAIM_RENEW_INTERVAL_SECONDS, WORKER_CONCURRENCY);
+        consumer = new BackfillConsumer(migrationService, ledger, OBJECT_MAPPER, NACK_BACKOFF_SECONDS);
+    }
+
+    @AfterEach
+    void tearDown() {
+        migrationService.shutdown();
     }
 
     @Test
@@ -97,6 +106,21 @@ class BackfillConsumerTest {
         assertEquals(Duration.ofSeconds(NACK_BACKOFF_SECONDS), ack.nackedWith,
                 "a vendor failure must be turned into a negative acknowledgment here rather than left to "
                         + "propagate into the container's own error handling");
+    }
+
+    @Test
+    void negativelyAcknowledgesWithBackoffWhenMigrateThrowsAnInfrastructureException() throws JsonProcessingException {
+        seedPending(1L, "invoice-1.txt", "content one");
+        objectStore.throwOnNextPut(new IllegalStateException("MinIO put failed"));
+        RecordingAcknowledgment ack = new RecordingAcknowledgment();
+
+        consumer.consume(message(1L), ack);
+
+        assertFalse(ack.acknowledged,
+                "a batch that fails for any reason other than an unparseable message must not be acknowledged");
+        assertEquals(Duration.ofSeconds(NACK_BACKOFF_SECONDS), ack.nackedWith,
+                "an infrastructure failure unrelated to the vendor call must also be turned into a negative "
+                        + "acknowledgment here, not left to propagate into the container's own error handling");
     }
 
     @Test

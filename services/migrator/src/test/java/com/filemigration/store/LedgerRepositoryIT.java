@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.boot.jdbc.DataSourceBuilder;
 import org.springframework.jdbc.core.JdbcTemplate;
 
+import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
@@ -262,6 +263,37 @@ class LedgerRepositoryIT {
         int renewed = ledger.renewClaims(List.of(done, pending));
 
         assertEquals(0, renewed, "renewClaims must only touch rows currently IN_FLIGHT");
+    }
+
+    /**
+     * Simulates two attempts at overlapping ids: one (attempt 1) already
+     * holds source_id "foreign" in a live, unexpired claim, and a second
+     * attempt claims a batch that happens to include both "own" and
+     * "foreign". claim() correctly leaves "foreign" out of what it
+     * returns, and the point of this test is that renewing exactly that
+     * returned list, and nothing else, never touches "foreign": a caller
+     * that renews whatever it actually claimed, rather than whatever ids
+     * it was originally asked about, can never extend a claim it does not
+     * hold.
+     */
+    @Test
+    void renewingOnlyWhatWasActuallyClaimedNeverTouchesAnotherAttemptsLiveClaim() {
+        long ownId = BASE_ID + 43;
+        long foreignId = BASE_ID + 44;
+        insertState(ownId, "backfill", "PENDING", 0);
+        insertState(foreignId, "backfill", "IN_FLIGHT", 1);
+        Timestamp foreignUpdatedAtBefore = jdbcTemplate.queryForObject(
+                "SELECT updated_at FROM migration_state WHERE source_id = ?", Timestamp.class, foreignId);
+
+        List<Long> claimed = ledger.claim(List.of(ownId, foreignId));
+        assertEquals(List.of(ownId), claimed, "the still-live foreign claim must not be handed to this attempt");
+
+        ledger.renewClaims(claimed);
+
+        Timestamp foreignUpdatedAtAfter = jdbcTemplate.queryForObject(
+                "SELECT updated_at FROM migration_state WHERE source_id = ?", Timestamp.class, foreignId);
+        assertEquals(foreignUpdatedAtBefore, foreignUpdatedAtAfter,
+                "renewing only what this attempt claimed must never touch another attempt's still-live claim");
     }
 
     private void insertState(long sourceId, String lane, String status, int attempts) {
