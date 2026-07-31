@@ -153,6 +153,92 @@ services:
       SEED_BATCH_SIZE: ${SEED_BATCH_SIZE:-500}
       SEED_PROGRESS_LOG_INTERVAL: ${SEED_PROGRESS_LOG_INTERVAL:-5000}
 
+  # Migrator image, built once and run twice under different profiles. The
+  # worker profile does per-file migration work; the coordinator profile
+  # plans backfill ranges. Neither profile does that work yet: this is the
+  # service skeleton and its data access layer, wired to both datasources,
+  # MinIO, and the ledger tables so later tasks can build the pipeline on
+  # top of it.
+  migrator-worker:
+    build: ./services/migrator
+    container_name: migrator-worker
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    ports:
+      - "8082:8082"
+    environment:
+      SPRING_PROFILES_ACTIVE: worker
+      SERVER_PORT: 8082
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_USER: root
+      MYSQL_PASSWORD: root
+      MYSQL_DATABASE: sourcedb
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DATABASE: targetdb
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET: documents
+      MINIO_REGION: us-east-1
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-8}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-0}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8082/actuator/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+  migrator-coordinator:
+    build: ./services/migrator
+    container_name: migrator-coordinator
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    ports:
+      - "8081:8081"
+    environment:
+      SPRING_PROFILES_ACTIVE: coordinator
+      SERVER_PORT: 8081
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_USER: root
+      MYSQL_PASSWORD: root
+      MYSQL_DATABASE: sourcedb
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DATABASE: targetdb
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET: documents
+      MINIO_REGION: us-east-1
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-8}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-0}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8081/actuator/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
 volumes:
   mysql-data:
   postgres-data:

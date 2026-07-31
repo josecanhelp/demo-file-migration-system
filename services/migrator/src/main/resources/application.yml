@@ -1,0 +1,37 @@
+server:
+  port: ${SERVER_PORT:8080}
+
+spring:
+  application:
+    name: migrator
+
+migrator:
+  worker-concurrency: ${WORKER_CONCURRENCY:8}
+  db-pool-size: ${DB_POOL_SIZE:0}
+  mysql:
+    host: ${MYSQL_HOST:mysql}
+    port: ${MYSQL_PORT:3306}
+    database: ${MYSQL_DATABASE:sourcedb}
+    username: ${MYSQL_USER:root}
+    password: ${MYSQL_PASSWORD:root}
+  postgres:
+    host: ${POSTGRES_HOST:postgres}
+    port: ${POSTGRES_PORT:5432}
+    database: ${POSTGRES_DATABASE:targetdb}
+    username: ${POSTGRES_USER:postgres}
+    password: ${POSTGRES_PASSWORD:postgres}
+  object-store:
+    endpoint: ${MINIO_ENDPOINT:http://minio:9000}
+    access-key: ${MINIO_ACCESS_KEY:minioadmin}
+    secret-key: ${MINIO_SECRET_KEY:minioadmin}
+    bucket: ${MINIO_BUCKET:documents}
+    region: ${MINIO_REGION:us-east-1}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: never
