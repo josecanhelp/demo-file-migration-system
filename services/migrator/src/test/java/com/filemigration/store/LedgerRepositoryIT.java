@@ -111,6 +111,42 @@ class LedgerRepositoryIT {
     }
 
     @Test
+    void ocrDoneRowWithCachedPayloadStaysClaimable() {
+        long id = BASE_ID + 4;
+        insertState(id, "backfill", "OCR_DONE", 1);
+        jdbcTemplate.update(
+                "UPDATE migration_state SET ocr_payload = ?::jsonb WHERE source_id = ?",
+                "{\"id\":" + id + ",\"text\":\"hello\",\"confidence\":0.9,\"pageCount\":1,\"jobId\":\"job-1\"}", id);
+
+        List<Long> claimed = ledger.claim(List.of(id));
+
+        assertEquals(List.of(id), claimed, "a row with a cached OCR payload must still be claimable");
+        Map<String, Object> row = jdbcTemplate.queryForMap(
+                "SELECT status, attempts, ocr_payload FROM migration_state WHERE source_id = ?", id);
+        assertEquals("IN_FLIGHT", row.get("status"));
+        assertEquals(2, row.get("attempts"));
+        assertTrue(row.get("ocr_payload").toString().contains("hello"),
+                "claiming an OCR_DONE row must not disturb its cached payload");
+    }
+
+    @Test
+    void findCachedOcrPayloadsReturnsOnlyIdsWithANonNullPayload() {
+        long withPayload = BASE_ID + 5;
+        long withoutPayload = BASE_ID + 6;
+        insertState(withPayload, "backfill", "OCR_DONE", 1);
+        insertState(withoutPayload, "backfill", "PENDING", 0);
+        jdbcTemplate.update(
+                "UPDATE migration_state SET ocr_payload = ?::jsonb WHERE source_id = ?",
+                "{\"id\":" + withPayload + ",\"text\":\"hello\",\"confidence\":0.9,\"pageCount\":1,\"jobId\":\"job-1\"}",
+                withPayload);
+
+        Map<Long, String> payloads = ledger.findCachedOcrPayloads(List.of(withPayload, withoutPayload));
+
+        assertEquals(1, payloads.size());
+        assertTrue(payloads.get(withPayload).contains("hello"));
+    }
+
+    @Test
     void claimReturnsOnlyTheClaimableIdsFromAMixedBatch() {
         long pending = BASE_ID + 10;
         long done = BASE_ID + 11;

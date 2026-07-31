@@ -1,0 +1,157 @@
+package com.filemigration.worker;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.filemigration.model.FileRecord;
+import com.filemigration.model.Stage;
+import com.filemigration.model.Status;
+import com.filemigration.vendor.ErrorClass;
+import com.filemigration.vendor.OcrResult;
+import com.filemigration.vendor.VendorException;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.List;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+/**
+ * Exercises MigrationService against in-memory fakes for every
+ * collaborator, so its ordering guarantees can be checked without any
+ * real database, object store, or vendor call.
+ */
+class MigrationServiceTest {
+
+    private FakeLedgerRepository ledger;
+    private FakeSourceFileRepository sourceRepo;
+    private FakeObjectStore objectStore;
+    private FakeDocumentRepository documentRepo;
+    private FakeEventRepository eventRepo;
+    private FakeVendorClient vendorClient;
+    private MigrationService service;
+
+    @BeforeEach
+    void setUp() {
+        ledger = new FakeLedgerRepository();
+        sourceRepo = new FakeSourceFileRepository();
+        objectStore = new FakeObjectStore();
+        documentRepo = new FakeDocumentRepository();
+        eventRepo = new FakeEventRepository();
+        vendorClient = new FakeVendorClient();
+        service = new MigrationService(ledger, sourceRepo, objectStore, documentRepo, eventRepo, vendorClient,
+                new ObjectMapper());
+    }
+
+    @Test
+    void reprocessingAFileDoesNotCallVendorTwice() {
+        seedPending(1L, "invoice.txt", "content one");
+
+        MigrationOutcome first = service.migrate(List.of(1L), "backfill");
+        MigrationOutcome second = service.migrate(List.of(1L), "backfill");
+
+        assertEquals(1, first.done());
+        assertEquals(0, second.done());
+        assertEquals(1, second.skipped());
+        assertEquals(1, vendorClient.callCount(), "claim blocks the second pass from reaching the vendor");
+        assertEquals(1, documentRepo.documentCount(), "the second pass must upsert, not insert");
+        assertEquals(Status.DONE, ledger.statusOf(1L));
+    }
+
+    @Test
+    void cachedOcrPayloadSkipsVendorOnRetryAfterCrash() throws Exception {
+        seedPending(1L, "invoice.txt", "INVOICE 00000001");
+        String cachedPayload = new ObjectMapper().writeValueAsString(
+                new OcrResult(1L, "INVOICE 00000001", 0.97, 1, "job-1"));
+        ledger.presetState(1L, Status.OCR_DONE, cachedPayload);
+
+        MigrationOutcome outcome = service.migrate(List.of(1L), "backfill");
+
+        assertEquals(0, vendorClient.callCount());
+        assertEquals(1, outcome.done());
+        assertEquals(Status.DONE, ledger.statusOf(1L));
+        assertEquals(1, documentRepo.documentCount());
+        assertEquals("INVOICE 00000001", documentRepo.get(1L).ocrText());
+    }
+
+    @Test
+    void permanentVendorFailureMarksFailedPermanentAndDoesNotRethrow() {
+        seedPending(5001L, "bad.txt", "whatever");
+        vendorClient.throwOnNextCall(new VendorException(ErrorClass.PERMANENT, null, "unprocessable"));
+
+        MigrationOutcome outcome = service.migrate(List.of(5001L), "backfill");
+
+        assertEquals(1, outcome.permanentFailures());
+        assertEquals(0, outcome.retryable());
+        assertEquals(Status.FAILED_PERMANENT, ledger.statusOf(5001L));
+        assertEquals(1, eventRepo.countByStageAndId(Stage.DLQ, 5001L));
+        assertEquals(0, documentRepo.documentCount());
+    }
+
+    @Test
+    void transientVendorFailureMarksFailedRetryableAndRethrows() {
+        seedPending(6001L, "flaky.txt", "whatever");
+        vendorClient.throwOnNextCall(new VendorException(ErrorClass.TRANSIENT, Duration.ofSeconds(1), "vendor down"));
+
+        VendorException thrown = assertThrows(VendorException.class, () -> service.migrate(List.of(6001L), "cdc"));
+
+        assertEquals(ErrorClass.TRANSIENT, thrown.errorClass());
+        assertEquals(Status.FAILED_RETRYABLE, ledger.statusOf(6001L));
+        assertEquals(1, eventRepo.countByStageAndId(Stage.RETRY, 6001L));
+        assertEquals(0, documentRepo.documentCount());
+    }
+
+    @Test
+    void mixedBatchSendsOnlyTheFreshFileToVendorAndBothReachDone() throws Exception {
+        seedPending(2L, "fresh.txt", "fresh content");
+        seedPending(1L, "cached.txt", "cached content");
+        String cachedPayload = new ObjectMapper().writeValueAsString(
+                new OcrResult(1L, "cached content", 0.9, 1, "job-1"));
+        ledger.presetState(1L, Status.OCR_DONE, cachedPayload);
+
+        MigrationOutcome outcome = service.migrate(List.of(1L, 2L), "backfill");
+
+        assertEquals(2, outcome.done());
+        assertEquals(1, vendorClient.callCount());
+        assertEquals(List.of(2L), vendorClient.idsFromCall(0), "only the fresh file should reach the vendor");
+        assertEquals(Status.DONE, ledger.statusOf(1L));
+        assertEquals(Status.DONE, ledger.statusOf(2L));
+        assertEquals(2, documentRepo.documentCount());
+    }
+
+    @Test
+    void idsNotClaimedAreSkippedAndNeverSentToVendor() {
+        seedPending(2L, "fresh.txt", "fresh content");
+        ledger.presetState(1L, Status.DONE, null);
+
+        MigrationOutcome outcome = service.migrate(List.of(1L, 2L), "backfill");
+
+        assertEquals(1, outcome.done());
+        assertEquals(1, outcome.skipped());
+        assertEquals(1, vendorClient.callCount());
+        assertEquals(List.of(2L), vendorClient.idsFromCall(0));
+        assertFalse(eventRepo.events().stream().anyMatch(e -> Long.valueOf(1L).equals(e.sourceId())),
+                "an id claim() did not return must never be touched");
+    }
+
+    @Test
+    void claimedIdsAreRecordedBeforeAnyVendorCall() {
+        seedPending(3L, "a.txt", "a");
+
+        service.migrate(List.of(3L), "backfill");
+
+        assertTrue(eventRepo.countByStageAndId(Stage.CLAIMED, 3L) >= 1);
+        assertEquals(1, eventRepo.countByStageAndId(Stage.OCR_DONE, 3L));
+        assertEquals(1, eventRepo.countByStageAndId(Stage.STORED, 3L));
+    }
+
+    private void seedPending(long id, String filename, String text) {
+        byte[] content = text.getBytes(StandardCharsets.UTF_8);
+        sourceRepo.put(new FileRecord(id, filename, "text/plain", content, content.length, Instant.now()));
+        ledger.presetPending(id);
+    }
+}

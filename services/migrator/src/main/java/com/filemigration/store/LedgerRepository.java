@@ -14,6 +14,7 @@ import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -26,16 +27,24 @@ import java.util.Map;
 public class LedgerRepository {
 
     // The RETURNING clause reports exactly which ids this statement moved
-    // into IN_FLIGHT. A row already IN_FLIGHT or further along matches
-    // neither status in the WHERE clause, so it is silently left out of
-    // the result instead of being claimed a second time. That is what
-    // lets several workers pull from the same batch of ids without two of
-    // them ever processing the same file at once.
+    // into IN_FLIGHT. A row already IN_FLIGHT matches none of the statuses
+    // in the WHERE clause, so it is silently left out of the result
+    // instead of being claimed a second time. That is what lets several
+    // workers pull from the same batch of ids without two of them ever
+    // processing the same file at once.
+    //
+    // OCR_DONE is included alongside PENDING and FAILED_RETRYABLE because
+    // a row can sit at OCR_DONE with its ocr_payload already saved but no
+    // document row written yet, if a worker crashed after paying for OCR
+    // but before finishing the write to the target store. Letting that
+    // row be claimed again is what lets a later attempt pick it back up
+    // and finish it using the cached payload instead of calling the
+    // vendor a second time.
     private static final String CLAIM_SQL =
             "UPDATE migration_state\n"
             + "   SET status = 'IN_FLIGHT', attempts = attempts + 1, updated_at = now()\n"
             + " WHERE source_id = ANY(?)\n"
-            + "   AND status IN ('PENDING', 'FAILED_RETRYABLE')\n"
+            + "   AND status IN ('PENDING', 'FAILED_RETRYABLE', 'OCR_DONE')\n"
             + "RETURNING source_id";
 
     private final JdbcTemplate targetJdbc;
@@ -78,11 +87,11 @@ public class LedgerRepository {
     }
 
     /**
-     * Attempts to move each given id from PENDING or FAILED_RETRYABLE into
-     * IN_FLIGHT. Only the ids this call actually transitioned come back;
-     * an id already claimed by another worker is silently dropped. Callers
-     * must treat the returned list, not the input list, as the set of ids
-     * they now own.
+     * Attempts to move each given id from PENDING, FAILED_RETRYABLE, or
+     * OCR_DONE into IN_FLIGHT. Only the ids this call actually
+     * transitioned come back; an id already claimed by another worker, or
+     * already DONE, is silently dropped. Callers must treat the returned
+     * list, not the input list, as the set of ids they now own.
      */
     public List<Long> claim(List<Long> ids) {
         if (ids == null || ids.isEmpty()) {
@@ -99,6 +108,34 @@ public class LedgerRepository {
                         claimed.add(rs.getLong("source_id"));
                     }
                     return claimed;
+                }
+            }
+        });
+    }
+
+    /**
+     * Looks up the saved OCR payload for each given id that has one.
+     * Ids with no payload yet are simply absent from the returned map, so
+     * a caller can tell a file that already has a cached OCR result apart
+     * from one that still needs the vendor called for it.
+     */
+    public Map<Long, String> findCachedOcrPayloads(List<Long> ids) {
+        if (ids == null || ids.isEmpty()) {
+            return Collections.emptyMap();
+        }
+        Long[] idArray = ids.toArray(new Long[0]);
+        return targetJdbc.execute((ConnectionCallback<Map<Long, String>>) connection -> {
+            Array sqlArray = connection.createArrayOf("bigint", idArray);
+            String sql = "SELECT source_id, ocr_payload FROM migration_state "
+                    + "WHERE source_id = ANY(?) AND ocr_payload IS NOT NULL";
+            try (PreparedStatement ps = connection.prepareStatement(sql)) {
+                ps.setArray(1, sqlArray);
+                try (ResultSet rs = ps.executeQuery()) {
+                    Map<Long, String> payloads = new HashMap<>();
+                    while (rs.next()) {
+                        payloads.put(rs.getLong("source_id"), rs.getString("ocr_payload"));
+                    }
+                    return payloads;
                 }
             }
         });
