@@ -57,6 +57,10 @@ async function main() {
     let inserted = 0;
     let loggedThrough = 0;
 
+    console.log(
+      `inserting ${rowsNeeded} rows in batches of ${SEED_BATCH_SIZE}, progress logged every ${SEED_PROGRESS_LOG_INTERVAL} rows`
+    );
+
     while (inserted < rowsNeeded) {
       const batchSize = Math.min(SEED_BATCH_SIZE, rowsNeeded - inserted);
       const ids = [];
