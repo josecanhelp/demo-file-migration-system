@@ -14,8 +14,20 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
  * implementation drifting away from the behavior it is supposed to
  * mirror, which would otherwise make the reconciler flag a perfectly good
  * migration as corrupt.
+ *
+ * Every whitespace code point outside plain ASCII is written as an
+ * explicit unicode escape rather than a literal character, so the
+ * invisible or easily-mangled ones (NBSP, BOM, line/paragraph separator)
+ * are unambiguous in source rather than relying on an editor or file
+ * encoding to preserve them correctly.
  */
 class OcrTextTransformTest {
+
+    private static final String NBSP = " ";
+    private static final String BOM = "﻿";
+    private static final String LINE_SEPARATOR = " ";
+    private static final String PARAGRAPH_SEPARATOR = " ";
+    private static final String IDEOGRAPHIC_SPACE = "　";
 
     @Test
     void collapsesMultipleSpacesToOne() {
@@ -60,6 +72,46 @@ class OcrTextTransformTest {
     @Test
     void wholeStringOfWhitespaceProducesAnEmptyString() {
         assertEquals("", extract("   \t\n  "));
+    }
+
+    @Test
+    void collapsesAndStripsNonBreakingSpace() {
+        // U+00A0: JavaScript's \s matches it, Java's \s and String.trim() do not.
+        assertEquals("HELLO WORLD", extract(NBSP + "hello" + NBSP + NBSP + "world" + NBSP));
+    }
+
+    @Test
+    void collapsesAndStripsByteOrderMark() {
+        // U+FEFF: JavaScript's \s matches it, Java's \s and String.trim() do not.
+        assertEquals("HELLO", extract(BOM + "hello"));
+    }
+
+    @Test
+    void collapsesAndStripsUnicodeLineAndParagraphSeparators() {
+        assertEquals("HELLO WORLD", extract("hello" + LINE_SEPARATOR + PARAGRAPH_SEPARATOR + "world"));
+    }
+
+    @Test
+    void collapsesAndStripsIdeographicSpace() {
+        // U+3000: part of Unicode's Space_Separator category, matched by
+        // JavaScript's \s but not by Java's \s.
+        assertEquals("HELLO WORLD", extract(IDEOGRAPHIC_SPACE + "hello" + IDEOGRAPHIC_SPACE + "world"
+                + IDEOGRAPHIC_SPACE));
+    }
+
+    @Test
+    void allNonBreakingSpaceInputProducesAnEmptyString() {
+        assertEquals("", extract(NBSP + NBSP + NBSP));
+    }
+
+    @Test
+    void allByteOrderMarkInputProducesAnEmptyString() {
+        assertEquals("", extract(BOM));
+    }
+
+    @Test
+    void nonAsciiTextIsUpperCasedAndPreservedAcrossMultiByteCharacters() {
+        assertEquals("CAFÉ ÜBER 日本語", extract("café  über\t日本語"));
     }
 
     private static String extract(String text) {

@@ -22,7 +22,12 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -30,19 +35,42 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * Exercises the reconciler against the real migrator-worker process and the
  * real Postgres, MySQL, and MinIO docker compose starts, proving it can
- * both report a clean migration and, just as importantly, catch every kind
- * of corruption it claims to check for. A reconciler that cannot fail this
- * class is not verifying anything.
+ * both report a clean migration and catch the corruption each test below
+ * introduces on purpose: a stale checksum column, OCR text that no longer
+ * matches the source, a document row's object missing from the store
+ * entirely, a document row's object present but holding the wrong bytes, a
+ * source row with no matching document row on its own (breaking the raw
+ * count agreement outright), that same condition instead compensated by an
+ * unrelated document row with no matching source row (so the raw counts
+ * still agree with each other even though nothing about the migration is
+ * clean), and a row currently FAILED_PERMANENT. A reconciler that cannot
+ * fail any one of these is not verifying the check it claims to. Not
+ * covered here: a document object that exists but cannot be read for a
+ * reason other than being absent (reported in unreadableObjects); there is
+ * no reliable way to make MinIO fail that way on demand in this
+ * environment.
  *
  * Every corruption test writes its own row under a reserved id range, well
- * clear of the ids the real seeded migration uses, so it never disturbs
- * that migration's own counts other than by the exact corruption each test
- * introduces on purpose. Every row is removed again in @AfterEach, whether
- * or not the test passed.
+ * clear of the ids the real seeded migration and every other suite in this
+ * project use, so it never disturbs that migration's own counts other than
+ * by the exact corruption each test introduces on purpose. Every row is
+ * removed again in @AfterEach, whether or not the test passed.
  */
 class ReconcileIT {
 
     private static final long BASE_ID = 9_700_000L;
+
+    /**
+     * The lowest id any IT suite in this project reserves for its own
+     * fixtures (GovernorIT, BackfillIT, this class, and others each use
+     * their own range at or above this floor). aFullyMigratedSourceTableReconcilesClean
+     * proves the real seeded corpus, ids below this floor, is clean; it
+     * does not, and must not, depend on no other suite having left a row
+     * behind somewhere above it; that is a separate concern those suites'
+     * own cleanup is responsible for.
+     */
+    private static final long RESERVED_RANGE_FLOOR = 9_000_000L;
+
     private static final String BUCKET = "documents";
     private static final int CONNECT_TIMEOUT_MS = 2000;
     private static final int READ_TIMEOUT_MS = 60000;
@@ -129,34 +157,34 @@ class ReconcileIT {
     /**
      * Deletes every row this suite could have written under its reserved id
      * range, then keeps re-deleting on a timer for a window longer than the
-     * live migrator-worker container's own CDC nack backoff (10 seconds by
-     * default): every insert or delete this class makes against the real
-     * MySQL files table is a real row change, so the real Debezium
-     * connector captures it, and that same container's CDC consumer,
-     * sharing this database, can claim and process the id after this
-     * method's first delete has already run, re-creating a migration_state
-     * row for an id this suite just removed with no source row left to
-     * back it. A single pass, or even a short one, can finish before that
-     * consumer's next retry lands; sweeping past its backoff window is
-     * what actually outlasts it, rather than merely reducing how often the
-     * race is lost.
+     * live migrator-worker container's own retry chain can possibly last:
+     * every insert or delete this class makes against the real MySQL files
+     * table is a real row change, so the real Debezium connector captures
+     * it, and that same container's CDC consumer, sharing this database,
+     * can claim and reprocess the id after this method's first delete has
+     * already run, re-creating a migration_state row for an id this suite
+     * just removed with no source row left to back it. With a 10 second
+     * nack backoff and 5 allowed attempts, a single failing message can
+     * still be retried up to roughly 50 seconds after this suite's own
+     * change; the sweep below runs for 70 seconds, comfortably past that,
+     * rather than merely reducing how often the race is lost.
      */
     @AfterEach
     void cleanUpReservedRows() {
         // The extended sweep below only matters for a test that actually
-        // wrote to the real MySQL files table; the read-only clean-run
-        // test never did, so there is no Debezium event in flight for it
-        // to race against and one plain delete pass is enough.
-        Instant deadline = wroteToSourceTable ? Instant.now().plus(Duration.ofSeconds(25)) : Instant.now();
+        // wrote to the real MySQL files table; a test that never did has
+        // no Debezium event in flight for it to race against, so one
+        // plain delete pass is enough.
+        Instant deadline = wroteToSourceTable ? Instant.now().plus(Duration.ofSeconds(70)) : Instant.now();
         do {
             targetJdbc.update("DELETE FROM document WHERE source_id >= ?", BASE_ID);
             targetJdbc.update("DELETE FROM migration_state WHERE source_id >= ?", BASE_ID);
             sourceJdbc.update("DELETE FROM files WHERE id >= ?", BASE_ID);
             if (Instant.now().isBefore(deadline)) {
-                sleep(Duration.ofSeconds(2));
+                sleep(Duration.ofSeconds(3));
             }
         } while (Instant.now().isBefore(deadline));
-        for (long id = BASE_ID + 1; id <= BASE_ID + 4; id++) {
+        for (long id = BASE_ID + 1; id <= BASE_ID + 8; id++) {
             objectStore.delete(objectStore.keyFor(id));
         }
     }
@@ -164,17 +192,32 @@ class ReconcileIT {
     /**
      * The real seeded migration this docker compose stack already ran end
      * to end. Polls rather than asserting on the first response, since the
-     * backfill lane may still be finishing when this suite starts.
+     * backfill lane may still be finishing when this suite starts. Scoped
+     * to ids below RESERVED_RANGE_FLOOR rather than to the endpoint's
+     * global clean flag or raw counts: this suite runs alongside others
+     * (GovernorIT, BackfillIT, CdcIT, and more) that write their own
+     * fixtures directly against the same live database under their own
+     * reserved ranges, and a row one of them left behind is that suite's
+     * problem to clean up, not evidence that the actual seeded corpus this
+     * test is responsible for is broken.
      */
     @Test
     void aFullyMigratedSourceTableReconcilesClean() {
-        ReconcileResult result = waitUntilClean(Duration.ofMinutes(3));
+        ReconcileResult result = waitUntilSeededCorpusClean(Duration.ofMinutes(3));
 
-        assertTrue(result.clean(), "expected the already-completed migration to reconcile clean; got: " + result);
-        assertTrue(result.checksumMismatches().isEmpty());
-        assertTrue(result.ocrMismatches().isEmpty());
-        assertTrue(result.missingObjects().isEmpty());
-        assertTrue(result.permanentFailures().isEmpty());
+        assertTrue(belowReservedRange(result.checksumMismatches()).isEmpty(),
+                "expected no checksum mismatches in the seeded corpus; got: " + result.checksumMismatches());
+        assertTrue(belowReservedRange(result.ocrMismatches()).isEmpty(),
+                "expected no OCR mismatches in the seeded corpus; got: " + result.ocrMismatches());
+        assertTrue(belowReservedRange(result.missingObjects()).isEmpty(),
+                "expected no missing objects in the seeded corpus; got: " + result.missingObjects());
+        assertTrue(belowReservedRange(result.missingDocuments()).isEmpty(),
+                "expected no source ids missing a document row in the seeded corpus; got: "
+                        + result.missingDocuments());
+        assertTrue(belowReservedRange(result.orphanDocuments()).isEmpty(),
+                "expected no orphan document rows in the seeded corpus; got: " + result.orphanDocuments());
+        assertTrue(belowReservedRange(permanentFailureIds(result)).isEmpty(),
+                "expected no permanent failures in the seeded corpus; got: " + result.permanentFailures());
     }
 
     @Test
@@ -242,7 +285,7 @@ class ReconcileIT {
     }
 
     @Test
-    void documentRowDeletedWhileSourceAndLedgerRemainCausesACountMismatch() {
+    void documentRowDeletedWhileSourceAndLedgerRemainIsReportedAsAMissingDocument() {
         long id = BASE_ID + 4;
         byte[] content = "Orphaned Ledger Row".getBytes(StandardCharsets.UTF_8);
         insertCleanRow(id, content);
@@ -254,20 +297,201 @@ class ReconcileIT {
         assertFalse(result.clean());
         assertNotEquals(result.sourceCount(), result.documentCount(),
                 "a source row with no matching document row must break the count agreement clean() requires");
+        assertTrue(result.missingDocuments().contains(id),
+                "expected " + id + " in missingDocuments, got " + result.missingDocuments());
+    }
+
+    /**
+     * Overwrites the actual bytes stored in MinIO for a document whose
+     * checksum column is left untouched and correct, proving the checksum
+     * check reads and hashes the real stored object rather than only ever
+     * comparing the checksum column against itself; the missing-object
+     * test above proves objectStore.get() is called, but not that its
+     * result is ever compared against anything.
+     */
+    @Test
+    void corruptedStoredObjectBytesIsDetectedAndClearedOnRestore() {
+        long id = BASE_ID + 6;
+        byte[] content = "Stored Bytes Target Document".getBytes(StandardCharsets.UTF_8);
+        insertCleanRow(id, content);
+        String objectKey = objectStore.keyFor(id);
+
+        objectStore.put(objectKey, "These are not the original bytes at all".getBytes(StandardCharsets.UTF_8),
+                "text/plain");
+
+        ReconcileResult corrupted = reconcile();
+        assertFalse(corrupted.clean());
+        assertTrue(corrupted.checksumMismatches().contains(id),
+                "expected " + id + " in checksumMismatches when the stored object bytes disagree with both "
+                        + "the source blob and the checksum column, got " + corrupted.checksumMismatches());
+
+        objectStore.put(objectKey, content, "text/plain");
+
+        ReconcileResult restored = reconcile();
+        assertFalse(restored.checksumMismatches().contains(id),
+                "restoring the correct bytes in the object store must clear the mismatch for this id");
+    }
+
+    /**
+     * Creates a migration_state row that is currently FAILED_PERMANENT
+     * with no source row behind it at all, the established way a row
+     * reaches that status, and proves permanentFailures actually reports
+     * it with its recorded error; nothing else in this suite ever produces
+     * a row in that status.
+     */
+    @Test
+    void permanentFailureWithNoSourceRowIsReportedAndClearedOnRemoval() {
+        long id = BASE_ID + 7;
+        String error = "Source record no longer exists for a claimed id";
+
+        targetJdbc.update("INSERT INTO migration_state (source_id, lane, status, source_version, "
+                        + "last_error, consecutive_failures) VALUES (?, ?, ?, ?, ?, ?)",
+                id, "cdc", "FAILED_PERMANENT", 0L, error, 5);
+
+        ReconcileResult result = reconcile();
+
+        assertFalse(result.clean());
+        assertTrue(findPermanentFailure(result, id).isPresent(),
+                "expected " + id + " in permanentFailures, got " + result.permanentFailures());
+        assertEquals(error, findPermanentFailure(result, id).get().error());
+
+        targetJdbc.update("DELETE FROM migration_state WHERE source_id = ?", id);
+
+        ReconcileResult restored = reconcile();
+        assertTrue(findPermanentFailure(restored, id).isEmpty(),
+                "removing the row must clear it from permanentFailures");
+    }
+
+    /**
+     * Constructs the exact scenario a cardinality-only check cannot see:
+     * one real, already-migrated source row loses its document row (a
+     * missing document), while a separate, unrelated id gains a document
+     * row with no source row behind it (an orphan document). sourceCount,
+     * ledgerCount, and documentCount all still agree with each other
+     * throughout, since one row disappeared from the document side and
+     * another took its place; only checking set membership by id, not
+     * just the totals, can tell the two ids apart from a genuinely clean
+     * migration.
+     *
+     * The missing-document side reuses an already-seeded real corpus id
+     * rather than deleting a fresh MySQL row: deleting straight from MySQL
+     * would be captured by the real Debezium connector and raced by the
+     * live migrator-worker's own CDC consumer, which tombstones a deleted
+     * source id's document and ledger rows together, undoing exactly the
+     * condition this test needs to hold still long enough to observe.
+     * Removing only this id's document row, leaving its real MySQL row
+     * and its DONE ledger row untouched, produces the identical
+     * missingDocuments condition without racing anything live; the only
+     * thing that could ever re-create its document row on its own is the
+     * backfill coordinator's periodic replanning, whose 30 second cycle is
+     * comfortably longer than this test's own window before it restores
+     * the row itself.
+     */
+    @Test
+    void aSourceRowMissingItsDocumentCompensatedByAnOrphanDocumentMustNotReadAsClean() {
+        long realSeededId = 17L;
+        long orphanId = BASE_ID + 5;
+
+        Map<String, Object> originalDocument = targetJdbc.queryForMap(
+                "SELECT filename, content_type, object_key, byte_size, checksum_sha256, ocr_text, "
+                        + "ocr_confidence, ocr_page_count, ocr_vendor_job_id FROM document WHERE source_id = ?",
+                realSeededId);
+
+        targetJdbc.update("DELETE FROM document WHERE source_id = ?", realSeededId);
+
+        // Deliberately no migration_state row for orphanId: orphanDocuments
+        // is a source/document set-membership check, not a ledger one, so
+        // a bare document row with nothing else backing it is enough to
+        // trigger it, and leaving ledger untouched here is what keeps
+        // ledgerCount itself unaffected by this scenario.
+        targetJdbc.update("INSERT INTO document (source_id, filename, content_type, object_key, byte_size, "
+                        + "checksum_sha256, ocr_text, ocr_confidence, ocr_page_count, ocr_vendor_job_id) "
+                        + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                orphanId, "orphan-" + orphanId + ".txt", "text/plain", objectStore.keyFor(orphanId), 4,
+                "0".repeat(64), "ORPHAN", 0.9, 1, "job_orphan_" + orphanId);
+
+        try {
+            ReconcileResult result = reconcile();
+
+            assertEquals(result.sourceCount(), result.ledgerCount(),
+                    "this scenario must not disturb the ledger count relative to the source count");
+            assertEquals(result.ledgerCount(), result.documentCount(),
+                    "this is exactly the compensating case: one row removed from the document table and "
+                            + "one added elsewhere, so the raw counts still agree with each other");
+            assertFalse(result.clean(),
+                    "a source row missing its document, exactly compensated by an unrelated orphan "
+                            + "document row, must never be masked by matching counts alone");
+            assertTrue(result.missingDocuments().contains(realSeededId),
+                    "expected " + realSeededId + " in missingDocuments, got " + result.missingDocuments());
+            assertTrue(result.orphanDocuments().contains(orphanId),
+                    "expected " + orphanId + " in orphanDocuments, got " + result.orphanDocuments());
+        } finally {
+            targetJdbc.update("DELETE FROM document WHERE source_id = ?", orphanId);
+            targetJdbc.update("INSERT INTO document (source_id, filename, content_type, object_key, byte_size, "
+                            + "checksum_sha256, ocr_text, ocr_confidence, ocr_page_count, ocr_vendor_job_id) "
+                            + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    realSeededId, originalDocument.get("filename"), originalDocument.get("content_type"),
+                    originalDocument.get("object_key"), originalDocument.get("byte_size"),
+                    originalDocument.get("checksum_sha256"), originalDocument.get("ocr_text"),
+                    originalDocument.get("ocr_confidence"), originalDocument.get("ocr_page_count"),
+                    originalDocument.get("ocr_vendor_job_id"));
+        }
+
+        ReconcileResult restored = reconcile();
+        assertFalse(restored.missingDocuments().contains(realSeededId),
+                "restoring the document row must clear it from missingDocuments");
+        assertFalse(restored.orphanDocuments().contains(orphanId),
+                "removing the orphan row must clear it from orphanDocuments");
     }
 
     private ReconcileResult reconcile() {
         return migratorClient.post().uri("/internal/reconcile").retrieve().body(ReconcileResult.class);
     }
 
-    private ReconcileResult waitUntilClean(Duration timeout) {
+    private ReconcileResult waitUntilSeededCorpusClean(Duration timeout) {
         Instant deadline = Instant.now().plus(timeout);
         ReconcileResult last = reconcile();
-        while (!last.clean() && Instant.now().isBefore(deadline)) {
+        while (!seededCorpusIsClean(last) && Instant.now().isBefore(deadline)) {
             sleep(Duration.ofSeconds(2));
             last = reconcile();
         }
         return last;
+    }
+
+    private static boolean seededCorpusIsClean(ReconcileResult result) {
+        return belowReservedRange(result.checksumMismatches()).isEmpty()
+                && belowReservedRange(result.ocrMismatches()).isEmpty()
+                && belowReservedRange(result.missingObjects()).isEmpty()
+                && belowReservedRange(result.missingDocuments()).isEmpty()
+                && belowReservedRange(result.orphanDocuments()).isEmpty()
+                && belowReservedRange(permanentFailureIds(result)).isEmpty();
+    }
+
+    private static List<Long> belowReservedRange(List<Long> ids) {
+        List<Long> filtered = new ArrayList<>();
+        for (Long id : ids) {
+            if (id < RESERVED_RANGE_FLOOR) {
+                filtered.add(id);
+            }
+        }
+        return filtered;
+    }
+
+    private static List<Long> permanentFailureIds(ReconcileResult result) {
+        List<Long> ids = new ArrayList<>();
+        for (ReconcileResult.PermanentFailure failure : result.permanentFailures()) {
+            ids.add(failure.id());
+        }
+        return ids;
+    }
+
+    private static Optional<ReconcileResult.PermanentFailure> findPermanentFailure(ReconcileResult result, long id) {
+        for (ReconcileResult.PermanentFailure failure : result.permanentFailures()) {
+            if (failure.id() == id) {
+                return Optional.of(failure);
+            }
+        }
+        return Optional.empty();
     }
 
     private static void sleep(Duration duration) {

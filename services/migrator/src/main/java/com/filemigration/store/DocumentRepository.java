@@ -4,6 +4,7 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
 
+import java.util.Collections;
 import java.util.List;
 
 /**
@@ -72,6 +73,21 @@ public class DocumentRepository {
                 (rs, rowNum) -> new DocumentRow(rs.getLong("source_id"), rs.getString("checksum_sha256"),
                         rs.getString("ocr_text"), rs.getString("object_key")),
                 afterId, limit);
+    }
+
+    /**
+     * Which of the given ids currently have a document row. Used by the
+     * reconciler to find a source id with no matching document row at
+     * all: any id passed in that does not come back here never made it
+     * into this table, regardless of what the row counts alone say.
+     */
+    public List<Long> existingIdsAmong(List<Long> ids) {
+        if (ids == null || ids.isEmpty()) {
+            return Collections.emptyList();
+        }
+        String placeholders = String.join(",", Collections.nCopies(ids.size(), "?"));
+        String sql = "SELECT source_id FROM document WHERE source_id IN (" + placeholders + ")";
+        return targetJdbc.query(sql, (rs, rowNum) -> rs.getLong("source_id"), ids.toArray());
     }
 
     /**
