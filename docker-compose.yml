@@ -108,6 +108,26 @@ services:
       retries: 20
       start_period: 30s
 
+  # Populates sourcedb.files with synthetic documents. Not part of a plain
+  # `docker compose up`: it lives in the tools profile and is invoked with
+  # `docker compose run --rm seeder` once mysql is ready.
+  seeder:
+    build: ./services/seeder
+    container_name: seeder
+    profiles:
+      - tools
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_USER: root
+      MYSQL_PASSWORD: root
+      MYSQL_DATABASE: sourcedb
+      SEED_FILE_COUNT: ${SEED_FILE_COUNT:-500}
+      SEED_FILE_SIZE_BYTES: ${SEED_FILE_SIZE_BYTES:-2048}
+
 volumes:
   mysql-data:
   postgres-data:

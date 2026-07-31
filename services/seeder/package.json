@@ -1,0 +1,16 @@
+{
+  "name": "seeder",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Populates the source MySQL database with synthetic documents for the file migration system.",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "mysql2": "^3.11.0"
+  }
+}
