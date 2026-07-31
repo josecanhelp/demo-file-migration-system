@@ -25,6 +25,7 @@ migrator:
   db-pool-size: ${DB_POOL_SIZE:0}
   claim-lease-seconds: ${CLAIM_LEASE_SECONDS:60}
   claim-renew-interval-seconds: ${CLAIM_RENEW_INTERVAL_SECONDS:10}
+  max-retry-attempts: ${MAX_RETRY_ATTEMPTS:5}
   backfill:
     range-size: ${BACKFILL_RANGE_SIZE:1000}
     range-lease-seconds: ${BACKFILL_RANGE_LEASE_SECONDS:300}
@@ -38,6 +39,15 @@ migrator:
     topic-partitions: ${CDC_TOPIC_PARTITIONS:3}
     group-id: cdc
     nack-backoff-seconds: ${CDC_NACK_BACKOFF_SECONDS:10}
+    reserved-rate-pct: ${CDC_RESERVED_RATE_PCT:20}
+  dlq:
+    topic: files.dlq
+    topic-partitions: ${DLQ_TOPIC_PARTITIONS:3}
+  breaker:
+    failure-rate-threshold: ${BREAKER_FAILURE_RATE_THRESHOLD:50}
+    open-duration-seconds: ${BREAKER_OPEN_DURATION_SECONDS:10}
+  governor:
+    retry-base-backoff-ms: ${GOVERNOR_RETRY_BASE_BACKOFF_MS:200}
   mysql:
     host: ${MYSQL_HOST:mysql}
     port: ${MYSQL_PORT:3306}
@@ -61,6 +71,7 @@ migrator:
     connect-timeout-ms: ${VENDOR_CONNECT_TIMEOUT_MS:2000}
     read-timeout-ms: ${VENDOR_READ_TIMEOUT_MS:10000}
     batch-size: ${VENDOR_BATCH_SIZE:25}
+    rate-limit-rps: ${VENDOR_RATE_LIMIT_RPS:50}
 
 management:
   endpoints:

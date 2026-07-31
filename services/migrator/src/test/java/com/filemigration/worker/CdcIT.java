@@ -3,6 +3,7 @@ package com.filemigration.worker;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.filemigration.governor.TestGovernorFactory;
 import com.filemigration.store.DocumentRepository;
 import com.filemigration.store.EventRepository;
 import com.filemigration.store.LedgerRepository;
@@ -120,6 +121,7 @@ class CdcIT {
     private static final long NACK_BACKOFF_SECONDS = 10L;
     private static final long CLAIM_RENEW_INTERVAL_SECONDS = 10L;
     private static final int WORKER_CONCURRENCY = 1;
+    private static final int MAX_RETRY_ATTEMPTS = 5;
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
     private static HikariDataSource targetDataSource;
@@ -201,7 +203,8 @@ class CdcIT {
         EventRepository eventRepo = new EventRepository(targetJdbc);
         VendorClient vendorClient = new VendorClient(vendorRestClient, OBJECT_MAPPER);
         migrationService = new MigrationService(ledger, sourceRepo, objectStore, documentRepo, eventRepo,
-                vendorClient, OBJECT_MAPPER, CLAIM_RENEW_INTERVAL_SECONDS, WORKER_CONCURRENCY);
+                vendorClient, TestGovernorFactory.passthrough(), OBJECT_MAPPER, CLAIM_RENEW_INTERVAL_SECONDS,
+                WORKER_CONCURRENCY, MAX_RETRY_ATTEMPTS);
         consumer = new CdcConsumer(migrationService, ledger, objectStore, eventRepo, OBJECT_MAPPER,
                 NACK_BACKOFF_SECONDS);
 

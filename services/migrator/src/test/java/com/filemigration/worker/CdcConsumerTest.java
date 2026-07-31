@@ -1,6 +1,7 @@
 package com.filemigration.worker;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.filemigration.governor.TestGovernorFactory;
 import com.filemigration.model.FileRecord;
 import com.filemigration.model.Stage;
 import com.filemigration.model.Status;
@@ -33,6 +34,7 @@ class CdcConsumerTest {
     private static final long NACK_BACKOFF_SECONDS = 10L;
     private static final long CLAIM_RENEW_INTERVAL_SECONDS = 10L;
     private static final int WORKER_CONCURRENCY = 1;
+    private static final int MAX_RETRY_ATTEMPTS = 5;
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
     private FakeLedgerRepository ledger;
@@ -51,8 +53,8 @@ class CdcConsumerTest {
         objectStore = new FakeObjectStore();
         eventRepo = new FakeEventRepository();
         migrationService = new MigrationService(ledger, sourceRepo, objectStore,
-                new FakeDocumentRepository(), eventRepo, vendorClient, OBJECT_MAPPER,
-                CLAIM_RENEW_INTERVAL_SECONDS, WORKER_CONCURRENCY);
+                new FakeDocumentRepository(), eventRepo, vendorClient, TestGovernorFactory.passthrough(),
+                OBJECT_MAPPER, CLAIM_RENEW_INTERVAL_SECONDS, WORKER_CONCURRENCY, MAX_RETRY_ATTEMPTS);
         consumer = new CdcConsumer(migrationService, ledger, objectStore, eventRepo, OBJECT_MAPPER,
                 NACK_BACKOFF_SECONDS);
     }
@@ -207,6 +209,20 @@ class CdcConsumerTest {
         consumer.consume(envelope("d", beforeRow(7L), null), ack);
 
         assertFalse(ack.acknowledged, "a failure deleting the object must not be acknowledged");
+        assertEquals(Duration.ofSeconds(NACK_BACKOFF_SECONDS), ack.nackedWith);
+    }
+
+    @Test
+    void negativelyAcknowledgesWithBackoffWhenFindUnresolvedThrows() {
+        putSourceRecord(10L, "invoice-10.txt", "content ten");
+        ledger.throwOnNextFindUnresolved(new IllegalStateException("Postgres blip"));
+        RecordingAcknowledgment ack = new RecordingAcknowledgment();
+
+        consumer.consume(envelope("c", null, afterRow(10L)), ack);
+
+        assertFalse(ack.acknowledged,
+                "a failure checking whether the id is fully resolved must not be acknowledged; it must never "
+                        + "reach the container's own error handling, which would commit the offset anyway");
         assertEquals(Duration.ofSeconds(NACK_BACKOFF_SECONDS), ack.nackedWith);
     }
 

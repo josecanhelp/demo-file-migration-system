@@ -2,6 +2,7 @@ package com.filemigration.coordinator;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.filemigration.backfill.BackfillMessage;
+import com.filemigration.governor.TestGovernorFactory;
 import com.filemigration.model.BackfillRange;
 import com.filemigration.store.BackfillCheckpointRepository;
 import com.filemigration.store.DocumentRepository;
@@ -96,6 +97,7 @@ class BackfillIT {
     private static final long NACK_BACKOFF_SECONDS = 30L;
     private static final long CLAIM_RENEW_INTERVAL_SECONDS = 10L;
     private static final int WORKER_CONCURRENCY = 1;
+    private static final int MAX_RETRY_ATTEMPTS = 5;
 
     private static HikariDataSource targetDataSource;
     private static HikariDataSource sourceDataSource;
@@ -172,7 +174,8 @@ class BackfillIT {
         EventRepository eventRepo = new EventRepository(targetJdbc);
         VendorClient vendorClient = new VendorClient(vendorRestClient, objectMapper);
         migrationService = new MigrationService(ledger, sourceRepo, objectStore, documentRepo,
-                eventRepo, vendorClient, objectMapper, CLAIM_RENEW_INTERVAL_SECONDS, WORKER_CONCURRENCY);
+                eventRepo, vendorClient, TestGovernorFactory.passthrough(), objectMapper,
+                CLAIM_RENEW_INTERVAL_SECONDS, WORKER_CONCURRENCY, MAX_RETRY_ATTEMPTS);
         BackfillCheckpointRepository checkpointRepo = new BackfillCheckpointRepository(targetJdbc,
                 CHECKPOINT_LEASE_SECONDS);
 

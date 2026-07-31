@@ -1,6 +1,8 @@
 package com.filemigration.worker;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.filemigration.governor.Governor;
+import com.filemigration.governor.TestGovernorFactory;
 import com.filemigration.model.FileRecord;
 import com.filemigration.model.Stage;
 import com.filemigration.model.Status;
@@ -32,6 +34,7 @@ class MigrationServiceTest {
 
     private static final long CLAIM_RENEW_INTERVAL_SECONDS = 10L;
     private static final int WORKER_CONCURRENCY = 1;
+    private static final int MAX_RETRY_ATTEMPTS = 5;
 
     private FakeLedgerRepository ledger;
     private FakeSourceFileRepository sourceRepo;
@@ -39,6 +42,7 @@ class MigrationServiceTest {
     private FakeDocumentRepository documentRepo;
     private FakeEventRepository eventRepo;
     private FakeVendorClient vendorClient;
+    private Governor governor;
     private MigrationService service;
 
     @BeforeEach
@@ -49,8 +53,9 @@ class MigrationServiceTest {
         documentRepo = new FakeDocumentRepository();
         eventRepo = new FakeEventRepository();
         vendorClient = new FakeVendorClient();
+        governor = TestGovernorFactory.passthrough();
         service = new MigrationService(ledger, sourceRepo, objectStore, documentRepo, eventRepo, vendorClient,
-                new ObjectMapper(), CLAIM_RENEW_INTERVAL_SECONDS, WORKER_CONCURRENCY);
+                governor, new ObjectMapper(), CLAIM_RENEW_INTERVAL_SECONDS, WORKER_CONCURRENCY, MAX_RETRY_ATTEMPTS);
     }
 
     @AfterEach
@@ -234,6 +239,35 @@ class MigrationServiceTest {
         assertEquals(1, eventRepo.countByStageAndId(Stage.DLQ, 41L));
         assertNull(documentRepo.get(41L), "the poisoned file must never get a document row");
         assertEquals(4, vendorClient.callCount(), "one whole-batch call plus one isolating retry per file");
+    }
+
+    @Test
+    void idAtTheRetryCapIsMovedToFailedPermanentWithADlqEventInsteadOfBeingReclaimed() {
+        ledger.presetFailedRetryable(7001L, MAX_RETRY_ATTEMPTS, "source record no longer exists for a claimed id");
+
+        MigrationOutcome outcome = service.migrate(List.of(7001L), "cdc");
+
+        assertEquals(0, outcome.done());
+        assertEquals(0, outcome.skipped());
+        assertEquals(1, outcome.permanentFailures());
+        assertEquals(0, outcome.retryable());
+        assertEquals(Status.FAILED_PERMANENT, ledger.statusOf(7001L));
+        assertEquals(1, eventRepo.countByStageAndId(Stage.DLQ, 7001L));
+        assertEquals(0, vendorClient.callCount(),
+                "an id already condemned by the retry cap must never be claimed or reach the vendor");
+    }
+
+    @Test
+    void idUnderTheRetryCapIsStillReclaimedAndCanStillReachDone() {
+        sourceRepo.put(new FileRecord(7002L, "retry.txt", "text/plain",
+                "content".getBytes(StandardCharsets.UTF_8), 7, Instant.now()));
+        ledger.presetFailedRetryable(7002L, MAX_RETRY_ATTEMPTS - 1, "vendor blip");
+
+        MigrationOutcome outcome = service.migrate(List.of(7002L), "cdc");
+
+        assertEquals(1, outcome.done());
+        assertEquals(0, outcome.permanentFailures());
+        assertEquals(Status.DONE, ledger.statusOf(7002L));
     }
 
     private void seedPending(long id, String filename, String text) {

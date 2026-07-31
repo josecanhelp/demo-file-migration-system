@@ -25,6 +25,7 @@ import java.util.Map;
 class FakeLedgerRepository extends LedgerRepository {
 
     private final Map<Long, Row> rows = new LinkedHashMap<>();
+    private RuntimeException throwOnNextFindUnresolved;
 
     FakeLedgerRepository() {
         super(null, 300L);
@@ -36,6 +37,17 @@ class FakeLedgerRepository extends LedgerRepository {
 
     void presetPending(long id) {
         presetState(id, Status.PENDING, null);
+    }
+
+    void presetFailedRetryable(long id, int attempts, String lastError) {
+        Row row = new Row(Status.FAILED_RETRYABLE, null);
+        row.attempts = attempts;
+        row.lastError = lastError;
+        rows.put(id, row);
+    }
+
+    void throwOnNextFindUnresolved(RuntimeException exception) {
+        this.throwOnNextFindUnresolved = exception;
     }
 
     Status statusOf(long id) {
@@ -75,6 +87,26 @@ class FakeLedgerRepository extends LedgerRepository {
     @Override
     public void tombstone(long id) {
         rows.remove(id);
+    }
+
+    @Override
+    public List<ExceededAttempt> failExceededAttempts(List<Long> ids, int maxAttempts) {
+        List<ExceededAttempt> exceeded = new ArrayList<>();
+        for (Long id : ids) {
+            Row row = rows.get(id);
+            boolean candidate = row != null && (row.status == Status.PENDING || row.status == Status.FAILED_RETRYABLE);
+            if (candidate && row.attempts >= maxAttempts) {
+                row.status = Status.FAILED_PERMANENT;
+                exceeded.add(new ExceededAttempt(id, row.attempts, row.lastError));
+            }
+        }
+        return exceeded;
+    }
+
+    @Override
+    public int attemptsOf(long id) {
+        Row row = rows.get(id);
+        return row == null ? 0 : row.attempts;
     }
 
     @Override
@@ -127,6 +159,11 @@ class FakeLedgerRepository extends LedgerRepository {
 
     @Override
     public List<Long> findUnresolved(List<Long> ids) {
+        if (throwOnNextFindUnresolved != null) {
+            RuntimeException toThrow = throwOnNextFindUnresolved;
+            throwOnNextFindUnresolved = null;
+            throw toThrow;
+        }
         List<Long> unresolved = new ArrayList<>();
         for (Long id : ids) {
             Row row = rows.get(id);

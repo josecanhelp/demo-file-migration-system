@@ -65,17 +65,20 @@ public class BackfillConsumer {
         }
 
         MigrationOutcome outcome;
+        List<Long> unresolved;
         try {
             outcome = migrationService.migrate(message.sourceIds(), message.lane());
+            unresolved = ledger.findUnresolved(message.sourceIds());
         } catch (Exception e) {
             // Deliberately broad: a vendor failure, a database problem, an
-            // object store problem, or anything else migrate() can throw
-            // must never let this message be acknowledged. Letting any of
-            // them propagate past here would hand the retry decision to
-            // the container's own generic error handling, which gives up
-            // after a handful of quick attempts and commits the offset
-            // anyway, exactly how a batch would go missing during an
-            // outage lasting longer than a couple of seconds.
+            // object store problem, or anything else migrate() or
+            // findUnresolved() can throw must never let this message be
+            // acknowledged. Letting any of them propagate past here would
+            // hand the retry decision to the container's own generic error
+            // handling, which gives up after a handful of quick attempts
+            // and commits the offset anyway, exactly how a batch would go
+            // missing during an outage lasting longer than a couple of
+            // seconds.
             log.warn("Backfill batch of {} id(s) failed processing ({}: {}); retrying in {}",
                     message.sourceIds().size(), e.getClass().getSimpleName(), e.getMessage(), unresolvedBackoff);
             acknowledgment.nack(unresolvedBackoff);
@@ -85,7 +88,6 @@ public class BackfillConsumer {
                 message.sourceIds().size(), outcome.done(), outcome.skipped(), outcome.permanentFailures(),
                 outcome.retryable());
 
-        List<Long> unresolved = ledger.findUnresolved(message.sourceIds());
         if (!unresolved.isEmpty()) {
             log.warn("Backfill batch left {} id(s) still unresolved after migrate() returned, most likely "
                     + "still claimed by an earlier attempt at this message that never finished; retrying "

@@ -3,6 +3,7 @@ package com.filemigration.worker;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.filemigration.backfill.BackfillMessage;
+import com.filemigration.governor.TestGovernorFactory;
 import com.filemigration.model.FileRecord;
 import com.filemigration.model.Status;
 import com.filemigration.vendor.ErrorClass;
@@ -35,6 +36,7 @@ class BackfillConsumerTest {
     private static final long NACK_BACKOFF_SECONDS = 30L;
     private static final long CLAIM_RENEW_INTERVAL_SECONDS = 10L;
     private static final int WORKER_CONCURRENCY = 1;
+    private static final int MAX_RETRY_ATTEMPTS = 5;
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
     private FakeLedgerRepository ledger;
@@ -51,8 +53,9 @@ class BackfillConsumerTest {
         vendorClient = new FakeVendorClient();
         objectStore = new FakeObjectStore();
         migrationService = new MigrationService(ledger, sourceRepo, objectStore,
-                new FakeDocumentRepository(), new FakeEventRepository(), vendorClient, OBJECT_MAPPER,
-                CLAIM_RENEW_INTERVAL_SECONDS, WORKER_CONCURRENCY);
+                new FakeDocumentRepository(), new FakeEventRepository(), vendorClient,
+                TestGovernorFactory.passthrough(), OBJECT_MAPPER,
+                CLAIM_RENEW_INTERVAL_SECONDS, WORKER_CONCURRENCY, MAX_RETRY_ATTEMPTS);
         consumer = new BackfillConsumer(migrationService, ledger, OBJECT_MAPPER, NACK_BACKOFF_SECONDS);
     }
 
@@ -121,6 +124,20 @@ class BackfillConsumerTest {
         assertEquals(Duration.ofSeconds(NACK_BACKOFF_SECONDS), ack.nackedWith,
                 "an infrastructure failure unrelated to the vendor call must also be turned into a negative "
                         + "acknowledgment here, not left to propagate into the container's own error handling");
+    }
+
+    @Test
+    void negativelyAcknowledgesWithBackoffWhenFindUnresolvedThrows() throws JsonProcessingException {
+        seedPending(1L, "invoice-1.txt", "content one");
+        ledger.throwOnNextFindUnresolved(new IllegalStateException("Postgres blip"));
+        RecordingAcknowledgment ack = new RecordingAcknowledgment();
+
+        consumer.consume(message(1L), ack);
+
+        assertFalse(ack.acknowledged,
+                "a failure checking whether the batch is fully resolved must not be acknowledged; it must never "
+                        + "reach the container's own error handling, which would commit the offset anyway");
+        assertEquals(Duration.ofSeconds(NACK_BACKOFF_SECONDS), ack.nackedWith);
     }
 
     @Test

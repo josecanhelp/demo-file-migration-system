@@ -238,6 +238,95 @@ class LedgerRepositoryIT {
     }
 
     @Test
+    void failExceededAttemptsMovesAtCapRowsToFailedPermanentAndPreservesLastErrorAndLeavesOthersAlone() {
+        long atCap = BASE_ID + 50;
+        long underCap = BASE_ID + 51;
+        insertState(atCap, "cdc", "FAILED_RETRYABLE", 5);
+        insertState(underCap, "cdc", "FAILED_RETRYABLE", 4);
+        jdbcTemplate.update("UPDATE migration_state SET last_error = ? WHERE source_id = ?", "boom", atCap);
+
+        List<LedgerRepository.ExceededAttempt> exceeded = ledger.failExceededAttempts(List.of(atCap, underCap), 5);
+
+        assertEquals(1, exceeded.size());
+        assertEquals(atCap, exceeded.get(0).sourceId());
+        assertEquals(5, exceeded.get(0).attempts());
+        assertEquals("boom", exceeded.get(0).lastError());
+        assertEquals("FAILED_PERMANENT", jdbcTemplate.queryForObject(
+                "SELECT status FROM migration_state WHERE source_id = ?", String.class, atCap));
+        assertEquals("FAILED_RETRYABLE", jdbcTemplate.queryForObject(
+                "SELECT status FROM migration_state WHERE source_id = ?", String.class, underCap));
+    }
+
+    @Test
+    void failExceededAttemptsLeavesInFlightAndOcrDoneRowsAlone() {
+        long inFlight = BASE_ID + 54;
+        long ocrDone = BASE_ID + 56;
+        insertState(inFlight, "cdc", "IN_FLIGHT", 6);
+        insertState(ocrDone, "cdc", "OCR_DONE", 6);
+
+        List<LedgerRepository.ExceededAttempt> exceeded = ledger.failExceededAttempts(
+                List.of(inFlight, ocrDone), 5);
+
+        assertTrue(exceeded.isEmpty(), "a row currently owned by a live or recently-live claim is never a "
+                + "candidate for the retry cap, only PENDING or FAILED_RETRYABLE is");
+    }
+
+    /**
+     * resetForUpdate forces a row back to PENDING before CdcConsumer
+     * migrates an updated envelope again, so a PENDING row can carry
+     * exactly the same accumulated attempts count a FAILED_RETRYABLE one
+     * would. Without also matching PENDING here, an id whose updates keep
+     * getting replayed could climb past maxAttempts indefinitely, since
+     * its status would never sit at FAILED_RETRYABLE long enough for this
+     * method to ever see it.
+     */
+    @Test
+    void failExceededAttemptsAlsoCatchesAPendingRowResetByAnUpdateWithAttemptsAlreadyAtTheCap() {
+        long pending = BASE_ID + 53;
+        insertState(pending, "cdc", "PENDING", 5);
+
+        List<LedgerRepository.ExceededAttempt> exceeded = ledger.failExceededAttempts(List.of(pending), 5);
+
+        assertEquals(1, exceeded.size());
+        assertEquals(pending, exceeded.get(0).sourceId());
+        assertEquals("FAILED_PERMANENT", jdbcTemplate.queryForObject(
+                "SELECT status FROM migration_state WHERE source_id = ?", String.class, pending));
+    }
+
+    @Test
+    void failExceededAttemptsLeavesAPendingRowUnderTheCapAlone() {
+        long pending = BASE_ID + 57;
+        insertState(pending, "cdc", "PENDING", 2);
+
+        List<LedgerRepository.ExceededAttempt> exceeded = ledger.failExceededAttempts(List.of(pending), 5);
+
+        assertTrue(exceeded.isEmpty());
+        assertEquals("PENDING", jdbcTemplate.queryForObject(
+                "SELECT status FROM migration_state WHERE source_id = ?", String.class, pending));
+    }
+
+    @Test
+    void claimNoLongerReclaimsAnIdAlreadyMovedToFailedPermanentByTheRetryCap() {
+        long id = BASE_ID + 52;
+        insertState(id, "cdc", "FAILED_RETRYABLE", 5);
+        ledger.failExceededAttempts(List.of(id), 5);
+
+        List<Long> claimed = ledger.claim(List.of(id));
+
+        assertTrue(claimed.isEmpty(), "an id already moved to FAILED_PERMANENT by the retry cap must not be "
+                + "claimable, which is exactly what stops it from nacking forever");
+    }
+
+    @Test
+    void attemptsOfReturnsTheCurrentAttemptsCountOrZeroForAnUnknownId() {
+        long id = BASE_ID + 55;
+        insertState(id, "cdc", "FAILED_RETRYABLE", 3);
+
+        assertEquals(3, ledger.attemptsOf(id));
+        assertEquals(0, ledger.attemptsOf(id + 1_000_000));
+    }
+
+    @Test
     void renewingAnInFlightClaimKeepsItFromBeingStolenOnceItsOriginalLeaseWouldHaveExpired() {
         long id = BASE_ID + 40;
         insertState(id, "backfill", "IN_FLIGHT", 1);

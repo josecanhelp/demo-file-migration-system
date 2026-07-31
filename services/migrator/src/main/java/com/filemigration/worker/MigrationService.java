@@ -2,6 +2,7 @@ package com.filemigration.worker;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.filemigration.governor.Governor;
 import com.filemigration.model.FileRecord;
 import com.filemigration.model.Stage;
 import com.filemigration.store.DocumentRepository;
@@ -62,23 +63,28 @@ public class MigrationService {
     private final DocumentRepository documentRepo;
     private final EventRepository eventRepo;
     private final VendorClient vendorClient;
+    private final Governor governor;
     private final ObjectMapper objectMapper;
     private final Duration claimRenewInterval;
+    private final int maxRetryAttempts;
     private final ScheduledExecutorService renewalExecutor;
 
     public MigrationService(LedgerRepository ledger, SourceFileRepository sourceRepo, ObjectStore objectStore,
             DocumentRepository documentRepo, EventRepository eventRepo, VendorClient vendorClient,
-            ObjectMapper objectMapper,
+            Governor governor, ObjectMapper objectMapper,
             @Value("${migrator.claim-renew-interval-seconds}") long claimRenewIntervalSeconds,
-            @Value("${migrator.worker-concurrency}") int workerConcurrency) {
+            @Value("${migrator.worker-concurrency}") int workerConcurrency,
+            @Value("${migrator.max-retry-attempts}") int maxRetryAttempts) {
         this.ledger = ledger;
         this.sourceRepo = sourceRepo;
         this.objectStore = objectStore;
         this.documentRepo = documentRepo;
         this.eventRepo = eventRepo;
         this.vendorClient = vendorClient;
+        this.governor = governor;
         this.objectMapper = objectMapper;
         this.claimRenewInterval = Duration.ofSeconds(claimRenewIntervalSeconds);
+        this.maxRetryAttempts = maxRetryAttempts;
         this.renewalExecutor = Executors.newScheduledThreadPool(Math.max(2, workerConcurrency), runnable -> {
             Thread thread = new Thread(runnable, "claim-renewer");
             thread.setDaemon(true);
@@ -99,12 +105,25 @@ public class MigrationService {
      * failed, or marked retryable and left claimable again for a later
      * attempt: done + skipped + permanentFailures + retryable always adds
      * up to the number of ids passed in.
+     *
+     * Before claiming anything, whichever given id is FAILED_RETRYABLE and
+     * has already used up every attempt it is allowed is moved straight to
+     * FAILED_PERMANENT and dead-lettered instead: claim() itself would
+     * otherwise reclaim it unconditionally forever, which is exactly how a
+     * single id with no way to ever succeed, for example one whose source
+     * row is permanently gone, ends up nacking forever and blocking every
+     * other id queued behind it on the same partition.
      */
     public MigrationOutcome migrate(List<Long> sourceIds, String lane) {
+        List<LedgerRepository.ExceededAttempt> exceeded = ledger.failExceededAttempts(sourceIds, maxRetryAttempts);
+        for (LedgerRepository.ExceededAttempt id : exceeded) {
+            deadLetter(id.sourceId(), lane, "MAX_RETRY_ATTEMPTS_EXCEEDED", id.attempts(), id.lastError());
+        }
+
         List<Long> claimed = ledger.claim(sourceIds);
-        int skipped = sourceIds.size() - claimed.size();
+        int skipped = sourceIds.size() - claimed.size() - exceeded.size();
         if (claimed.isEmpty()) {
-            return new MigrationOutcome(0, skipped, 0, 0);
+            return new MigrationOutcome(0, skipped, exceeded.size(), 0);
         }
 
         // Scheduled against claimed, and only claimed: an id from
@@ -140,7 +159,10 @@ public class MigrationService {
             }
 
             int done = 0;
-            int permanentFailures = 0;
+            // Seeded with what failExceededAttempts already condemned
+            // above, so the two returns below never have to add it back
+            // in separately.
+            int permanentFailures = exceeded.size();
             int retryable = 0;
 
             for (Long id : cachedIds) {
@@ -170,7 +192,7 @@ public class MigrationService {
             if (!freshRecords.isEmpty()) {
                 Map<Long, OcrResult> results;
                 try {
-                    results = vendorClient.ocrBatch(freshRecords);
+                    results = governor.execute(lane, () -> vendorClient.ocrBatch(freshRecords));
                 } catch (VendorException e) {
                     if (e.errorClass() == ErrorClass.PERMANENT) {
                         IsolationResult isolation = isolatePermanentFailure(freshRecords, lane);
@@ -233,7 +255,8 @@ public class MigrationService {
         if (freshRecords.size() == 1) {
             FileRecord record = freshRecords.get(0);
             ledger.markFailed(record.id(), "Vendor rejected this file", true);
-            eventRepo.record(record.id(), Stage.DLQ, lane, null);
+            deadLetter(record.id(), lane, ErrorClass.PERMANENT.name(), ledger.attemptsOf(record.id()),
+                    "Vendor rejected this file");
             return new IsolationResult(0, 1, 0, null);
         }
 
@@ -244,7 +267,7 @@ public class MigrationService {
             FileRecord record = freshRecords.get(i);
             Map<Long, OcrResult> singleResult;
             try {
-                singleResult = vendorClient.ocrBatch(List.of(record));
+                singleResult = governor.execute(lane, () -> vendorClient.ocrBatch(List.of(record)));
             } catch (VendorException individual) {
                 if (individual.errorClass() != ErrorClass.PERMANENT) {
                     for (int j = i; j < freshRecords.size(); j++) {
@@ -254,7 +277,8 @@ public class MigrationService {
                     return new IsolationResult(done, permanentFailures, retryable, individual);
                 }
                 ledger.markFailed(record.id(), individual.getMessage(), true);
-                eventRepo.record(record.id(), Stage.DLQ, lane, null);
+                deadLetter(record.id(), lane, ErrorClass.PERMANENT.name(), ledger.attemptsOf(record.id()),
+                        individual.getMessage());
                 permanentFailures++;
                 continue;
             }
@@ -275,6 +299,29 @@ public class MigrationService {
     private void markRetryable(long id, String message, String lane) {
         ledger.markFailed(id, message, false);
         eventRepo.record(id, Stage.RETRY, lane, null);
+    }
+
+    /**
+     * Records the DLQ stage for an id the caller has already marked
+     * FAILED_PERMANENT, both in migration_event and on the files.dlq Kafka
+     * topic via {@link Governor#deadLetter}, so a permanently failed file
+     * is visible in both places regardless of which of the paths inside
+     * this class that lead to FAILED_PERMANENT called it.
+     */
+    private void deadLetter(long id, String lane, String errorClass, int attempts, String lastError) {
+        eventRepo.record(id, Stage.DLQ, lane, writeDlqDetail(errorClass, attempts, lastError));
+        governor.deadLetter(id, lane, errorClass, attempts, lastError);
+    }
+
+    private String writeDlqDetail(String errorClass, int attempts, String lastError) {
+        try {
+            return objectMapper.writeValueAsString(Map.of(
+                    "errorClass", errorClass,
+                    "attempts", attempts,
+                    "lastError", lastError == null ? "" : lastError));
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("Failed to serialize a DLQ event detail", e);
+        }
     }
 
     private void finishDocument(FileRecord record, OcrResult ocr, String lane) {

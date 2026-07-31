@@ -126,6 +126,66 @@ public class LedgerRepository {
     }
 
     /**
+     * Moves whichever of the given ids is PENDING or FAILED_RETRYABLE with
+     * attempts already at or past maxAttempts straight to FAILED_PERMANENT,
+     * without touching last_error: the message already there is the real
+     * reason this id keeps failing, and overwriting it with "exceeded max
+     * attempts" would throw that reason away right when a caller most
+     * needs it for a dead-letter record. Must run before {@link #claim},
+     * since claim's own WHERE clause reclaims a PENDING or FAILED_RETRYABLE
+     * row unconditionally; calling this first is what stops an id from
+     * being retried forever once it has already used up every attempt it
+     * is allowed.
+     *
+     * PENDING is included, not only FAILED_RETRYABLE, because
+     * {@link #resetForUpdate} forces a row back to PENDING before an
+     * updated CDC envelope is migrated again, which would otherwise let an
+     * id dodge this cap indefinitely: attempts keeps climbing on every
+     * claim, but the status this method matches on never sits at
+     * FAILED_RETRYABLE long enough to be caught.
+     */
+    public List<ExceededAttempt> failExceededAttempts(List<Long> ids, int maxAttempts) {
+        if (ids == null || ids.isEmpty()) {
+            return Collections.emptyList();
+        }
+        Long[] idArray = ids.toArray(new Long[0]);
+        String sql = "UPDATE migration_state\n"
+                + "   SET status = 'FAILED_PERMANENT', updated_at = now()\n"
+                + " WHERE source_id = ANY(?)\n"
+                + "   AND status IN ('PENDING', 'FAILED_RETRYABLE')\n"
+                + "   AND attempts >= ?\n"
+                + "RETURNING source_id, attempts, last_error";
+        return targetJdbc.execute((ConnectionCallback<List<ExceededAttempt>>) connection -> {
+            Array sqlArray = connection.createArrayOf("bigint", idArray);
+            try (PreparedStatement ps = connection.prepareStatement(sql)) {
+                ps.setArray(1, sqlArray);
+                ps.setInt(2, maxAttempts);
+                try (ResultSet rs = ps.executeQuery()) {
+                    List<ExceededAttempt> exceeded = new ArrayList<>();
+                    while (rs.next()) {
+                        exceeded.add(new ExceededAttempt(rs.getLong("source_id"), rs.getInt("attempts"),
+                                rs.getString("last_error")));
+                    }
+                    return exceeded;
+                }
+            }
+        });
+    }
+
+    /**
+     * The current attempts count for one id, used only to enrich a
+     * dead-letter record with how many times this id was attempted before
+     * the failure that finally sent it to FAILED_PERMANENT. Returns 0 for
+     * an id with no row rather than failing, since a caller building a
+     * best-effort dead-letter record should not itself fail over this.
+     */
+    public int attemptsOf(long id) {
+        List<Integer> attempts = targetJdbc.queryForList(
+                "SELECT attempts FROM migration_state WHERE source_id = ?", Integer.class, id);
+        return attempts.isEmpty() ? 0 : attempts.get(0);
+    }
+
+    /**
      * Refreshes updated_at for whichever of the given ids is currently
      * IN_FLIGHT, so a worker still actively processing a batch keeps its
      * claim from expiring out from under it. An id that is not IN_FLIGHT,
@@ -269,5 +329,14 @@ public class LedgerRepository {
     public void tombstone(long id) {
         targetJdbc.update("DELETE FROM document WHERE source_id = ?", id);
         targetJdbc.update("DELETE FROM migration_state WHERE source_id = ?", id);
+    }
+
+    /**
+     * One id {@link #failExceededAttempts} moved to FAILED_PERMANENT,
+     * carrying the attempts count and last_error already on that row at
+     * the moment it was moved, so a caller can build a dead-letter record
+     * without a second query.
+     */
+    public record ExceededAttempt(long sourceId, int attempts, String lastError) {
     }
 }

@@ -114,6 +114,7 @@ public class CdcConsumer {
 
         eventRepo.record(id, Stage.CDC_CAPTURED, LANE, null);
 
+        List<Long> unresolved;
         try {
             switch (envelope.op()) {
                 case OP_CREATE, OP_READ -> {
@@ -139,22 +140,22 @@ public class CdcConsumer {
                 default -> log.error("CDC envelope for id {} carried an unrecognized op '{}', acknowledging it "
                         + "since retrying would never help", id, envelope.op());
             }
+            unresolved = ledger.findUnresolved(List.of(id));
         } catch (Exception e) {
             // Deliberately broad, mirroring BackfillConsumer: a vendor
             // failure, a database problem, an object store problem, or
-            // anything else this branch can throw must never let this
-            // envelope be acknowledged. Letting it propagate would hand
-            // the retry decision to the container's own generic error
-            // handling, which gives up quickly and commits the offset
-            // anyway, losing this change during any outage longer than a
-            // couple of seconds.
+            // anything else this branch or findUnresolved() can throw must
+            // never let this envelope be acknowledged. Letting it
+            // propagate would hand the retry decision to the container's
+            // own generic error handling, which gives up quickly and
+            // commits the offset anyway, losing this change during any
+            // outage longer than a couple of seconds.
             log.warn("CDC envelope for id {} (op {}) failed processing ({}: {}); retrying in {}",
                     id, envelope.op(), e.getClass().getSimpleName(), e.getMessage(), nackBackoff);
             acknowledgment.nack(nackBackoff);
             return;
         }
 
-        List<Long> unresolved = ledger.findUnresolved(List.of(id));
         if (!unresolved.isEmpty()) {
             log.warn("CDC id {} still unresolved after processing, most likely still claimed by an earlier "
                     + "attempt that never finished; retrying in {}", id, nackBackoff);
