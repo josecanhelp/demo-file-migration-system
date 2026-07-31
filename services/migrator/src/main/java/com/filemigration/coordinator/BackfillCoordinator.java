@@ -59,6 +59,7 @@ public class BackfillCoordinator {
     private final int vendorBatchSize;
     private final String topic;
     private final long planIntervalSeconds;
+    private boolean announcedComplete;
 
     public BackfillCoordinator(SourceFileRepository sourceRepo, BackfillCheckpointRepository checkpointRepo,
             LedgerRepository ledger, EventRepository eventRepo, KafkaTemplate<String, String> kafkaTemplate,
@@ -112,8 +113,10 @@ public class BackfillCoordinator {
         int plannedRanges = checkpointRepo.planRanges(maxId, rangeSize);
         if (plannedRanges > 0) {
             log.info("Backfill planning covers ids 1 through {}, inserted {} new range(s)", maxId, plannedRanges);
+            announcedComplete = false;
         }
 
+        boolean processedAnyRange = false;
         while (true) {
             checkpointRepo.reapExpiredClaims();
             Optional<BackfillRange> claimed = checkpointRepo.claimNextRange();
@@ -121,8 +124,20 @@ public class BackfillCoordinator {
                 break;
             }
             processRange(claimed.get());
+            processedAnyRange = true;
         }
-        log.info("backfill planning complete, checking again in {}s", planIntervalSeconds);
+
+        // Logged once on the pass that actually reaches "nothing left",
+        // not on every idle pass afterward: with nothing new to plan and
+        // nothing left to claim, every subsequent pass would otherwise
+        // repeat the exact same line forever.
+        if (processedAnyRange) {
+            announcedComplete = false;
+        }
+        if (!announcedComplete) {
+            log.info("backfill planning complete, checking again in {}s", planIntervalSeconds);
+            announcedComplete = true;
+        }
     }
 
     private void sleepInterval() {

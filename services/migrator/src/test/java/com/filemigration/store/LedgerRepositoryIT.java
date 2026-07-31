@@ -236,6 +236,34 @@ class LedgerRepositoryIT {
         assertEquals(List.of(inFlight, retryable, pending), sorted(unresolved));
     }
 
+    @Test
+    void renewingAnInFlightClaimKeepsItFromBeingStolenOnceItsOriginalLeaseWouldHaveExpired() {
+        long id = BASE_ID + 40;
+        insertState(id, "backfill", "IN_FLIGHT", 1);
+        jdbcTemplate.update("UPDATE migration_state SET updated_at = now() - interval '1 hour' "
+                + "WHERE source_id = ?", id);
+
+        int renewed = ledger.renewClaims(List.of(id));
+        assertEquals(1, renewed);
+
+        List<Long> claimed = ledger.claim(List.of(id));
+
+        assertTrue(claimed.isEmpty(),
+                "a claim renewed after its original lease would have expired must not be stolen");
+    }
+
+    @Test
+    void renewClaimsLeavesRowsThatAreNotInFlightUntouched() {
+        long done = BASE_ID + 41;
+        long pending = BASE_ID + 42;
+        insertState(done, "backfill", "DONE", 1);
+        insertState(pending, "backfill", "PENDING", 0);
+
+        int renewed = ledger.renewClaims(List.of(done, pending));
+
+        assertEquals(0, renewed, "renewClaims must only touch rows currently IN_FLIGHT");
+    }
+
     private void insertState(long sourceId, String lane, String status, int attempts) {
         jdbcTemplate.update(
                 "INSERT INTO migration_state (source_id, lane, status, attempts) VALUES (?, ?, ?, ?)",

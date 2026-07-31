@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.filemigration.backfill.BackfillMessage;
 import com.filemigration.model.FileRecord;
 import com.filemigration.model.Status;
+import com.filemigration.vendor.ErrorClass;
+import com.filemigration.vendor.VendorException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.kafka.support.Acknowledgment;
@@ -30,6 +32,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class BackfillConsumerTest {
 
     private static final long NACK_BACKOFF_SECONDS = 30L;
+    private static final long CLAIM_RENEW_INTERVAL_SECONDS = 10L;
+    private static final int WORKER_CONCURRENCY = 1;
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
     private FakeLedgerRepository ledger;
@@ -44,7 +48,8 @@ class BackfillConsumerTest {
         vendorClient = new FakeVendorClient();
         MigrationService migrationService = new MigrationService(ledger, sourceRepo, new FakeObjectStore(),
                 new FakeDocumentRepository(), new FakeEventRepository(), vendorClient, OBJECT_MAPPER);
-        consumer = new BackfillConsumer(migrationService, ledger, OBJECT_MAPPER, NACK_BACKOFF_SECONDS);
+        consumer = new BackfillConsumer(migrationService, ledger, OBJECT_MAPPER, NACK_BACKOFF_SECONDS,
+                CLAIM_RENEW_INTERVAL_SECONDS, WORKER_CONCURRENCY);
     }
 
     @Test
@@ -78,6 +83,20 @@ class BackfillConsumerTest {
                 "the batch must be negatively acknowledged with the configured backoff");
         assertEquals(Status.DONE, ledger.statusOf(1L), "the id that could be resolved still was");
         assertEquals(Status.IN_FLIGHT, ledger.statusOf(2L), "the still-claimed id is untouched, not lost");
+    }
+
+    @Test
+    void negativelyAcknowledgesWithBackoffWhenTheVendorCallFails() throws JsonProcessingException {
+        seedPending(1L, "invoice-1.txt", "content one");
+        vendorClient.throwOnNextCall(new VendorException(ErrorClass.TRANSIENT, null, "vendor unreachable"));
+        RecordingAcknowledgment ack = new RecordingAcknowledgment();
+
+        consumer.consume(message(1L), ack);
+
+        assertFalse(ack.acknowledged, "a batch that fails calling the vendor must not be acknowledged");
+        assertEquals(Duration.ofSeconds(NACK_BACKOFF_SECONDS), ack.nackedWith,
+                "a vendor failure must be turned into a negative acknowledgment here rather than left to "
+                        + "propagate into the container's own error handling");
     }
 
     @Test

@@ -93,6 +93,8 @@ class BackfillIT {
     private static final int TEST_VENDOR_BATCH_SIZE = 2;
     private static final long PLAN_INTERVAL_SECONDS = 30L;
     private static final long NACK_BACKOFF_SECONDS = 30L;
+    private static final long CLAIM_RENEW_INTERVAL_SECONDS = 10L;
+    private static final int WORKER_CONCURRENCY = 1;
 
     private static HikariDataSource targetDataSource;
     private static HikariDataSource sourceDataSource;
@@ -183,7 +185,8 @@ class BackfillIT {
 
         coordinator = new BackfillCoordinator(sourceRepo, checkpointRepo, ledger, eventRepo, kafkaTemplate,
                 objectMapper, 1000L, TEST_VENDOR_BATCH_SIZE, TOPIC, PLAN_INTERVAL_SECONDS);
-        consumer = new BackfillConsumer(migrationService, ledger, objectMapper, NACK_BACKOFF_SECONDS);
+        consumer = new BackfillConsumer(migrationService, ledger, objectMapper, NACK_BACKOFF_SECONDS,
+                CLAIM_RENEW_INTERVAL_SECONDS, WORKER_CONCURRENCY);
     }
 
     @AfterAll

@@ -35,13 +35,15 @@ public class LedgerRepository {
     // without updating it. A row still within its lease is left alone, so
     // a worker actively handling it is not interrupted mid-flight.
     //
-    // This recovers from a crash at any point in the pipeline, not only
-    // the window right after saveOcrPayload, but it does not guarantee
-    // exactly one owner at every instant: nothing renews the lease while
-    // work is in progress, so a row whose lease happens to expire while a
-    // worker is still legitimately processing it can be claimed a second
-    // time. What it does guarantee is that no claimed file is ever
-    // stranded forever.
+    // A worker that is still actively working a row keeps its lease alive
+    // by renewing it (see renewClaims), touching updated_at well before
+    // the lease would otherwise expire. That is what lets the lease be
+    // sized to a small multiple of the renewal interval rather than the
+    // worst case processing time for an entire batch: a row only ever
+    // sits unrenewed for the length of one real crash, not for however
+    // long the batch it was in takes to finish. What this guarantees is
+    // that no claimed file is ever stranded forever, and that detecting a
+    // crash takes on the order of the lease, not the order of a batch.
     private static final String CLAIM_SQL =
             "UPDATE migration_state\n"
             + "   SET status = 'IN_FLIGHT', attempts = attempts + 1, updated_at = now()\n"
@@ -119,6 +121,31 @@ public class LedgerRepository {
                     }
                     return claimed;
                 }
+            }
+        });
+    }
+
+    /**
+     * Refreshes updated_at for whichever of the given ids is currently
+     * IN_FLIGHT, so a worker still actively processing a batch keeps its
+     * claim from expiring out from under it. An id that is not IN_FLIGHT,
+     * whether because it was never claimed by this attempt or has already
+     * moved past it, is left untouched. Meant to be called on a much
+     * shorter interval than the claim lease, so a live worker's ids never
+     * come close to expiring while a dead one's do so quickly.
+     */
+    public int renewClaims(List<Long> ids) {
+        if (ids == null || ids.isEmpty()) {
+            return 0;
+        }
+        Long[] idArray = ids.toArray(new Long[0]);
+        return targetJdbc.execute((ConnectionCallback<Integer>) connection -> {
+            Array sqlArray = connection.createArrayOf("bigint", idArray);
+            String sql = "UPDATE migration_state SET updated_at = now() "
+                    + "WHERE source_id = ANY(?) AND status = 'IN_FLIGHT'";
+            try (PreparedStatement ps = connection.prepareStatement(sql)) {
+                ps.setArray(1, sqlArray);
+                return ps.executeUpdate();
             }
         });
     }

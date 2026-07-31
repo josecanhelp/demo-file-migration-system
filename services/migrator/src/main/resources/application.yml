@@ -23,7 +23,8 @@ spring:
 migrator:
   worker-concurrency: ${WORKER_CONCURRENCY:8}
   db-pool-size: ${DB_POOL_SIZE:0}
-  claim-lease-seconds: ${CLAIM_LEASE_SECONDS:300}
+  claim-lease-seconds: ${CLAIM_LEASE_SECONDS:60}
+  claim-renew-interval-seconds: ${CLAIM_RENEW_INTERVAL_SECONDS:10}
   backfill:
     range-size: ${BACKFILL_RANGE_SIZE:1000}
     range-lease-seconds: ${BACKFILL_RANGE_LEASE_SECONDS:300}
