@@ -359,6 +359,51 @@ services:
       retries: 20
       start_period: 30s
 
+  # API and live event stream for the dashboard. Reads Postgres and MySQL
+  # directly, proxies vendor-mock and migrator-worker for the two admin
+  # actions the dashboard exposes, and inserts new source files straight
+  # into sourcedb.files so they arrive through the same binlog path as any
+  # other application write.
+  control-plane:
+    build: ./services/control-plane
+    container_name: control-plane
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      vendor-mock:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: ${CONTROL_PLANE_PORT:-8080}
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_USER: root
+      MYSQL_PASSWORD: root
+      MYSQL_DATABASE: sourcedb
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DATABASE: targetdb
+      VENDOR_BASE_URL: ${VENDOR_BASE_URL:-http://vendor-mock:8088}
+      MIGRATOR_BASE_URL: ${MIGRATOR_BASE_URL:-http://migrator-worker:8082}
+      EVENT_POLL_INTERVAL_MS: ${EVENT_POLL_INTERVAL_MS:-500}
+      EVENT_POLL_LIMIT: ${EVENT_POLL_LIMIT:-500}
+      SSE_MAX_EVENTS_PER_TICK: ${SSE_MAX_EVENTS_PER_TICK:-200}
+      STATS_STREAM_INTERVAL_MS: ${STATS_STREAM_INTERVAL_MS:-1000}
+      SLA_ALERT_SECONDS: ${SLA_ALERT_SECONDS:-1800}
+      SLA_TARGET_SECONDS: ${SLA_TARGET_SECONDS:-3600}
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:8080/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
 volumes:
   mysql-data:
   postgres-data:

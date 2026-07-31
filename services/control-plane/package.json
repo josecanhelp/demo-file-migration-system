@@ -1,0 +1,19 @@
+{
+  "name": "control-plane",
+  "version": "1.0.0",
+  "private": true,
+  "description": "API and live event stream for the migration dashboard.",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test test/"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "mysql2": "^3.11.0",
+    "pg": "^8.12.0"
+  }
+}
