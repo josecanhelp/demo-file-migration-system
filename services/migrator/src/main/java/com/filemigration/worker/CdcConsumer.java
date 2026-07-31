@@ -24,12 +24,25 @@ import java.util.List;
  * Consumes Debezium change envelopes for sourcedb.files and drives each one
  * through {@link MigrationService} the moment it lands, rather than waiting
  * for the backfill lane to sweep past that id. A create or read envelope
- * seeds a PENDING row and migrates it; an update resets the row so it is
- * re-OCR'd against the new content and migrates it; a delete removes the
- * row and its document from both stores. An envelope is only acknowledged
- * once whatever it named has actually reached a terminal state, mirroring
- * BackfillConsumer: any failure other than a message this consumer cannot
- * even parse comes back for another try instead of being silently dropped.
+ * seeds a PENDING row and migrates it. An update seeds a PENDING row too,
+ * before resetting it, so an update for an id the ledger has never seen
+ * (the backfill lane has not reached it yet) is handled exactly like a
+ * create rather than silently doing nothing; resetting after seeding also
+ * covers the ordinary case of a row the ledger already tracks, clearing
+ * its cached OCR result so it is re-OCR'd against the new content. A
+ * delete removes the row and its document from both stores.
+ *
+ * A create, read, or update envelope is acknowledged once the id it names
+ * has reached a terminal state (DONE or FAILED_PERMANENT), or negatively
+ * acknowledged with a backoff if it has not, the same rule
+ * BackfillConsumer applies. A delete envelope is acknowledged once the
+ * removal itself completes without throwing. Three kinds of envelope are
+ * acknowledged immediately without any of that: one this consumer cannot
+ * parse at all, one whose id cannot be determined from the fields Debezium
+ * populated, and one whose op is not c, r, u, or d. Retrying any of those
+ * three would never succeed, so acknowledging them immediately is what
+ * keeps one from blocking every envelope behind it on the same partition
+ * forever.
  *
  * Debezium always excludes the blob column from what it publishes here
  * (see column.exclude.list in the connector config), so every envelope
@@ -108,6 +121,14 @@ public class CdcConsumer {
                     migrationService.migrate(List.of(id), LANE);
                 }
                 case OP_UPDATE -> {
+                    // Seeded before it is reset: an update is proof the row
+                    // exists in the source and belongs in the target, so an
+                    // id the ledger has never seen yet (seedPending is a
+                    // no-op for one it already has) gets exactly the same
+                    // PENDING row a create would give it, rather than
+                    // resetForUpdate matching zero rows and this envelope
+                    // being acknowledged with nothing done.
+                    ledger.seedPending(List.of(id), LANE, null);
                     ledger.resetForUpdate(id, envelope.version());
                     migrationService.migrate(List.of(id), LANE);
                 }

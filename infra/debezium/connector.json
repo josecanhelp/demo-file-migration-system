@@ -12,6 +12,7 @@
     "table.include.list": "sourcedb.files",
     "column.exclude.list": "sourcedb.files.content",
     "snapshot.mode": "no_data",
+    "include.schema.changes": false,
     "schema.history.internal.kafka.bootstrap.servers": "kafka:9092",
     "schema.history.internal.kafka.topic": "schema-history.sourcedb"
   }

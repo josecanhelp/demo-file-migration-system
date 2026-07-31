@@ -104,6 +104,22 @@ class CdcConsumerTest {
     }
 
     @Test
+    void updateEnvelopeForAnIdTheLedgerHasNeverSeenIsSeededAndMigratedRatherThanAckedAwayWithNothingDone() {
+        // No presetState/presetPending for id 9: the ledger has never
+        // heard of it, exactly as if the backfill lane has not reached it
+        // yet. resetForUpdate alone would match zero rows here.
+        putSourceRecord(9L, "invoice-9.txt", "brand new content");
+        RecordingAcknowledgment ack = new RecordingAcknowledgment();
+
+        consumer.consume(envelope("u", null, afterRow(9L)), ack);
+
+        assertTrue(ack.acknowledged, "an update for a previously untracked id must still resolve to DONE");
+        assertEquals(Status.DONE, ledger.statusOf(9L),
+                "an update for an id the ledger has never seen must be seeded and migrated, not silently dropped");
+        assertEquals(1, vendorClient.callCount());
+    }
+
+    @Test
     void deleteEnvelopeReadsIdFromBeforeAndTombstonesAndDeletesTheObject() {
         ledger.presetState(4L, Status.DONE, null);
         RecordingAcknowledgment ack = new RecordingAcknowledgment();

@@ -1,5 +1,7 @@
 package com.filemigration.worker;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.filemigration.store.DocumentRepository;
 import com.filemigration.store.EventRepository;
@@ -17,7 +19,10 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.springframework.boot.env.YamlPropertySourceLoader;
 import org.springframework.boot.jdbc.DataSourceBuilder;
+import org.springframework.core.env.PropertySource;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.support.GeneratedKeyHolder;
@@ -42,6 +47,7 @@ import java.sql.Statement;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -50,15 +56,23 @@ import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Exercises the CDC lane end to end against the real stack docker compose
  * starts: a change made straight against MySQL, with no message this test
  * publishes itself, has to be picked up by the real Debezium connector,
  * carried across the real cdc.sourcedb.files topic, and driven through a
- * real CdcConsumer to a terminal state in the real Postgres and MinIO. If
- * Debezium, Kafka, or CdcConsumer are not actually wired up correctly,
- * this fails on a timeout rather than passing vacuously.
+ * real CdcConsumer instance to a terminal state in the real Postgres and
+ * MinIO, with the actual ack/nack decision it made along the way checked,
+ * not merely the database state it left behind. If Debezium, Kafka, or
+ * CdcConsumer's own processing are not actually wired up correctly, this
+ * fails on a timeout or a failed assertion rather than passing vacuously.
+ * Whether the real @KafkaListener annotation itself is bound to the
+ * configured topic, group id, and ack mode is a separate concern this
+ * class does not touch; {@code CdcListenerWiringTest} covers that.
  *
  * This test drives its own dedicated CdcConsumer instance, reading the
  * real topic under a consumer group unique to this run, rather than
@@ -81,6 +95,14 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
  * unrelated, permanently unresolvable message from another suite is
  * simply passed over rather than blocking anything.
  *
+ * Every poll loop below polls at least once before it ever looks at its
+ * own success condition, so a condition that happens to already be true
+ * (for example because the live container's own "cdc" group got there
+ * first) can never make this test's own consumer look like it did
+ * something it did not: this test's own consume() call for a given id's
+ * envelope is what the ack/nack assertions below examine, not a guess
+ * about who produced the database row this test can also see.
+ *
  * Every row this test writes uses a filename carrying the "cdcit-" prefix
  * and is removed after each test by the exact id MySQL assigned it, never
  * by a broad filter or a truncate.
@@ -88,22 +110,13 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 class CdcIT {
 
     private static final String BUCKET = "documents";
-    private static final String TOPIC = "cdc.sourcedb.files";
     private static final Duration DETECTION_TIMEOUT = Duration.ofSeconds(30);
     private static final Duration POLL_TIMEOUT = Duration.ofSeconds(2);
     private static final long LEASE_SECONDS = 300L;
     private static final long NACK_BACKOFF_SECONDS = 10L;
     private static final long CLAIM_RENEW_INTERVAL_SECONDS = 10L;
     private static final int WORKER_CONCURRENCY = 1;
-    private static final Acknowledgment NO_OP_ACK = new Acknowledgment() {
-        @Override
-        public void acknowledge() {
-        }
-
-        @Override
-        public void nack(Duration sleep) {
-        }
-    };
+    private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
     private static HikariDataSource targetDataSource;
     private static HikariDataSource sourceDataSource;
@@ -114,8 +127,11 @@ class CdcIT {
     private static MigrationService migrationService;
     private static CdcConsumer consumer;
     private static KafkaConsumer<String, String> rawConsumer;
+    private static String topic;
 
     private final List<Long> insertedIds = new ArrayList<>();
+    private final Map<Long, RecordingAcknowledgment> lastAckById = new HashMap<>();
+    private final Map<Long, String> lastPayloadById = new HashMap<>();
 
     @BeforeAll
     static void connect() throws Exception {
@@ -174,17 +190,23 @@ class CdcIT {
                 .requestFactory(requestFactory)
                 .build();
 
-        ObjectMapper objectMapper = new ObjectMapper();
         LedgerRepository ledger = new LedgerRepository(targetJdbc, LEASE_SECONDS);
         SourceFileRepository sourceRepo = new SourceFileRepository(sourceJdbc);
         ObjectStore objectStore = new ObjectStore(s3Client, BUCKET);
         DocumentRepository documentRepo = new DocumentRepository(targetJdbc);
         EventRepository eventRepo = new EventRepository(targetJdbc);
-        VendorClient vendorClient = new VendorClient(vendorRestClient, objectMapper);
+        VendorClient vendorClient = new VendorClient(vendorRestClient, OBJECT_MAPPER);
         migrationService = new MigrationService(ledger, sourceRepo, objectStore, documentRepo, eventRepo,
-                vendorClient, objectMapper, CLAIM_RENEW_INTERVAL_SECONDS, WORKER_CONCURRENCY);
-        consumer = new CdcConsumer(migrationService, ledger, objectStore, eventRepo, objectMapper,
+                vendorClient, OBJECT_MAPPER, CLAIM_RENEW_INTERVAL_SECONDS, WORKER_CONCURRENCY);
+        consumer = new CdcConsumer(migrationService, ledger, objectStore, eventRepo, OBJECT_MAPPER,
                 NACK_BACKOFF_SECONDS);
+
+        // Read from the same application.yml key the real @KafkaListener
+        // binds to (migrator.cdc.topic) instead of a literal duplicated
+        // here, so a rename of that property is caught by this test
+        // failing to find anything on the topic it expects, rather than
+        // silently subscribing to a name nothing publishes to anymore.
+        topic = resolveConfiguredTopic();
 
         String kafkaBootstrapServers = System.getenv().getOrDefault("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092");
         Map<String, Object> consumerProps = Map.of(
@@ -194,7 +216,19 @@ class CdcIT {
                 ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class,
                 ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
         rawConsumer = new KafkaConsumer<>(consumerProps);
-        rawConsumer.subscribe(List.of(TOPIC));
+        rawConsumer.subscribe(List.of(topic));
+    }
+
+    private static String resolveConfiguredTopic() throws Exception {
+        List<PropertySource<?>> sources = new YamlPropertySourceLoader()
+                .load("application", new ClassPathResource("application.yml"));
+        for (PropertySource<?> source : sources) {
+            Object value = source.getProperty("migrator.cdc.topic");
+            if (value != null) {
+                return value.toString();
+            }
+        }
+        throw new IllegalStateException("migrator.cdc.topic is not set in application.yml");
     }
 
     @AfterAll
@@ -229,6 +263,8 @@ class CdcIT {
             sourceJdbc.update("DELETE FROM files WHERE id = ?", id);
         }
         insertedIds.clear();
+        lastAckById.clear();
+        lastPayloadById.clear();
     }
 
     @Test
@@ -239,12 +275,20 @@ class CdcIT {
         driveConsumptionUntil(() -> isDone(id), DETECTION_TIMEOUT,
                 "source_id " + id + " did not reach status DONE");
 
+        assertAcknowledged(id, "the create envelope");
+
         Map<String, Object> document = targetJdbc.queryForMap("SELECT * FROM document WHERE source_id = ?", id);
         assertEquals("files/" + id, document.get("object_key"));
         assertEquals(extractText(content), document.get("ocr_text"));
 
         byte[] stored = getObject("files/" + id);
         assertArrayEquals(content, stored, "the object written to MinIO must match the source content");
+
+        // column.exclude.list is what keeps multi-megabyte blobs off
+        // Kafka; this is the one place that would notice a regression
+        // that put the blob column back on the wire.
+        JsonNode after = OBJECT_MAPPER.readTree(lastPayloadById.get(id)).get("after");
+        assertFalse(after.has("content"), "the CDC envelope must never carry the blob column");
     }
 
     @Test
@@ -265,6 +309,7 @@ class CdcIT {
             return current != null && !Objects.equals(current, originalOcrText);
         }, DETECTION_TIMEOUT, "document.ocr_text for source_id " + id + " never changed from its original value");
 
+        assertAcknowledged(id, "the update envelope");
         assertEquals(extractText(updated), queryOcrTextOrNull(id), "the OCR text must reflect the updated content");
         assertEquals("DONE", targetJdbc.queryForObject(
                 "SELECT status FROM migration_state WHERE source_id = ?", String.class, id));
@@ -290,34 +335,94 @@ class CdcIT {
         driveConsumptionUntil(() -> isGoneFromLedgerAndDocument(id) && isGoneFromObjectStore(objectKey),
                 DETECTION_TIMEOUT,
                 "source_id " + id + " still has a ledger row, a document row, or a MinIO object after deletion");
+
+        assertAcknowledged(id, "the delete envelope");
+    }
+
+    private void assertAcknowledged(long id, String description) {
+        RecordingAcknowledgment ack = lastAckById.get(id);
+        assertTrue(ack != null && ack.acknowledged,
+                description + " for id " + id + " must be acknowledged once its effect is visible");
+        assertNull(ack.nackedWith, description + " for id " + id + " must not also carry a negative acknowledgment");
     }
 
     /**
-     * Polls the real cdc.sourcedb.files topic and feeds every record
-     * through this test's own CdcConsumer instance, exactly as the live
-     * container's listener would, until the given condition is met or the
-     * timeout elapses. A record naming an id this test does not recognize
-     * is processed exactly the same way as one of its own: harmlessly,
-     * since CdcConsumer's own broad catch already turns any failure into
-     * a logged nack rather than an exception, and this loop does not
-     * examine the ack/nack outcome at all, only whether its own condition
-     * is now true.
+     * Polls the real cdc.sourcedb.files topic at least once, feeding every
+     * record through this test's own CdcConsumer instance and recording
+     * the ack/nack decision it made, before ever looking at whether the
+     * given condition is satisfied yet; only then does it check the
+     * condition, and it keeps alternating the two until the condition is
+     * true or the timeout elapses. Polling before checking is what makes
+     * the ack/nack recorded here trustworthy: checking first would let a
+     * condition already satisfied by the live container's own "cdc" group
+     * end the loop before this test's consumer ever ran, leaving the
+     * assertions that follow checking a stale or absent recording instead
+     * of this call's own outcome.
+     *
+     * Every id this call has already seen a nack for is replayed against
+     * its own stored payload on each pass, the same effect a real nack
+     * has in production: the live container's "cdc" group consumes the
+     * same real topic this test does, under its own group id, so it can
+     * legitimately win the race to claim a row this test also just
+     * inserted, in which case this test's own attempt correctly nacks
+     * (the row is not yet DONE from where this attempt is standing) while
+     * the live container finishes it. Replaying converges the recording
+     * this test asserts on to the truth once the row settles, rather than
+     * asserting on whichever side happened to lose an ordinary claim
+     * race.
      */
     private void driveConsumptionUntil(BooleanSupplier condition, Duration timeout, String timeoutMessage) {
         Instant deadline = Instant.now().plus(timeout);
-        while (Instant.now().isBefore(deadline)) {
+        do {
+            ConsumerRecords<String, String> records = rawConsumer.poll(POLL_TIMEOUT);
+            for (ConsumerRecord<String, String> record : records) {
+                processRecord(record.value());
+            }
+            replayNackedPayloads();
             if (condition.getAsBoolean()) {
                 return;
             }
-            ConsumerRecords<String, String> records = rawConsumer.poll(POLL_TIMEOUT);
-            for (ConsumerRecord<String, String> record : records) {
-                consumer.consume(record.value(), NO_OP_ACK);
+        } while (Instant.now().isBefore(deadline));
+        throw new AssertionError(timeoutMessage + " within " + timeout);
+    }
+
+    private void replayNackedPayloads() {
+        for (Map.Entry<Long, RecordingAcknowledgment> entry : new ArrayList<>(lastAckById.entrySet())) {
+            if (entry.getValue().nackedWith != null) {
+                String payload = lastPayloadById.get(entry.getKey());
+                if (payload != null) {
+                    processRecord(payload);
+                }
             }
         }
-        if (condition.getAsBoolean()) {
-            return;
+    }
+
+    private void processRecord(String payload) {
+        RecordingAcknowledgment ack = new RecordingAcknowledgment();
+        consumer.consume(payload, ack);
+        Long id = extractId(payload);
+        if (id != null) {
+            lastAckById.put(id, ack);
+            lastPayloadById.put(id, payload);
         }
-        throw new AssertionError(timeoutMessage + " within " + timeout);
+    }
+
+    /**
+     * Parses just enough of the envelope to know which id it concerns,
+     * reusing CdcConsumer's own envelope shape rather than a second,
+     * possibly diverging, definition of it. A null value (Kafka's own
+     * post-delete tombstone) or a message that fails to parse carries no
+     * id to record anything against.
+     */
+    private Long extractId(String payload) {
+        if (payload == null) {
+            return null;
+        }
+        try {
+            return OBJECT_MAPPER.readValue(payload, CdcConsumer.CdcEnvelope.class).sourceId();
+        } catch (JsonProcessingException e) {
+            return null;
+        }
     }
 
     private boolean isDone(long id) {
@@ -387,5 +492,21 @@ class CdcIT {
 
     private static void setVendorMode(String mode) {
         vendorAdminClient.post().uri("/admin/mode").body(Map.of("mode", mode)).retrieve().toBodilessEntity();
+    }
+
+    private static final class RecordingAcknowledgment implements Acknowledgment {
+
+        private boolean acknowledged;
+        private Duration nackedWith;
+
+        @Override
+        public void acknowledge() {
+            acknowledged = true;
+        }
+
+        @Override
+        public void nack(Duration sleep) {
+            nackedWith = sleep;
+        }
     }
 }
