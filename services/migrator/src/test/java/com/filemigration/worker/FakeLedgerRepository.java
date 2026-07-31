@@ -3,6 +3,7 @@ package com.filemigration.worker;
 import com.filemigration.model.Status;
 import com.filemigration.store.LedgerRepository;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -16,7 +17,10 @@ import java.util.Map;
  * claimable here to model a row whose claim lease has already expired
  * after a crash. The real repository only reclaims an OCR_DONE or
  * IN_FLIGHT row once its lease has actually expired, which is what
- * LedgerRepositoryIT exercises against a real Postgres instance.
+ * LedgerRepositoryIT exercises against a real Postgres instance. Also
+ * fakes seedPending, resetForUpdate, and tombstone, so a consumer test
+ * driving those directly (rather than through a coordinator) does not
+ * need its own subclass.
  */
 class FakeLedgerRepository extends LedgerRepository {
 
@@ -42,6 +46,35 @@ class FakeLedgerRepository extends LedgerRepository {
     String lastErrorOf(long id) {
         Row row = rows.get(id);
         return row == null ? null : row.lastError;
+    }
+
+    boolean exists(long id) {
+        return rows.containsKey(id);
+    }
+
+    @Override
+    public int seedPending(List<Long> ids, String lane, Map<Long, Instant> createdAt) {
+        int inserted = 0;
+        for (Long id : ids) {
+            if (!rows.containsKey(id)) {
+                rows.put(id, new Row(Status.PENDING, null));
+                inserted++;
+            }
+        }
+        return inserted;
+    }
+
+    @Override
+    public void resetForUpdate(long id, long version) {
+        Row row = rows.computeIfAbsent(id, unused -> new Row(Status.PENDING, null));
+        row.status = Status.PENDING;
+        row.ocrPayload = null;
+        row.lastError = null;
+    }
+
+    @Override
+    public void tombstone(long id) {
+        rows.remove(id);
     }
 
     @Override
@@ -96,8 +129,15 @@ class FakeLedgerRepository extends LedgerRepository {
     public List<Long> findUnresolved(List<Long> ids) {
         List<Long> unresolved = new ArrayList<>();
         for (Long id : ids) {
-            Status status = statusOf(id);
-            if (status != Status.DONE && status != Status.FAILED_PERMANENT) {
+            Row row = rows.get(id);
+            // No row at all, whether because it was never seeded or
+            // because tombstone() just removed it, mirrors the real
+            // query's WHERE source_id = ANY(ids): an id with no matching
+            // row is simply absent from the result set, not unresolved.
+            if (row == null) {
+                continue;
+            }
+            if (row.status != Status.DONE && row.status != Status.FAILED_PERMANENT) {
                 unresolved.add(id);
             }
         }

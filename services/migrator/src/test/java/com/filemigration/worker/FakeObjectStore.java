@@ -3,18 +3,22 @@ package com.filemigration.worker;
 import com.filemigration.store.ObjectStore;
 
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * In-memory stand-in for ObjectStore. Tracks how many times put was
- * called and what landed under each key, without touching any real
- * object storage.
+ * called and what landed under each key, and which keys were deleted,
+ * without touching any real object storage.
  */
 class FakeObjectStore extends ObjectStore {
 
     private final Map<String, byte[]> objects = new HashMap<>();
+    private final Set<String> deletedKeys = new HashSet<>();
     private int putCount = 0;
     private RuntimeException nextPutFailure;
+    private RuntimeException nextDeleteFailure;
 
     FakeObjectStore() {
         super(null, "documents");
@@ -22,6 +26,30 @@ class FakeObjectStore extends ObjectStore {
 
     int putCount() {
         return putCount;
+    }
+
+    boolean wasDeleted(String key) {
+        return deletedKeys.contains(key);
+    }
+
+    @Override
+    public void delete(String key) {
+        if (nextDeleteFailure != null) {
+            RuntimeException toThrow = nextDeleteFailure;
+            nextDeleteFailure = null;
+            throw toThrow;
+        }
+        objects.remove(key);
+        deletedKeys.add(key);
+    }
+
+    /**
+     * The very next call to delete() throws this instead of removing
+     * anything, simulating an infrastructure problem unrelated to the
+     * ledger tombstone it is paired with.
+     */
+    void throwOnNextDelete(RuntimeException exception) {
+        this.nextDeleteFailure = exception;
     }
 
     /**

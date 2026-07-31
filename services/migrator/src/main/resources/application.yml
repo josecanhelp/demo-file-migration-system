@@ -33,6 +33,11 @@ migrator:
     topic: files.backfill
     topic-partitions: ${BACKFILL_TOPIC_PARTITIONS:3}
     group-id: backfill
+  cdc:
+    topic: cdc.sourcedb.files
+    topic-partitions: ${CDC_TOPIC_PARTITIONS:3}
+    group-id: cdc
+    nack-backoff-seconds: ${CDC_NACK_BACKOFF_SECONDS:10}
   mysql:
     host: ${MYSQL_HOST:mysql}
     port: ${MYSQL_PORT:3306}
