@@ -23,14 +23,26 @@ import java.util.regex.Pattern;
  * whitespace at all. A source file with a leading BOM or an embedded NBSP
  * would otherwise produce a value here that disagrees with the vendor
  * mock's own extractText for an otherwise perfectly migrated file.
+ *
+ * The leading and trailing patterns below anchor with \A and \z, the true
+ * start and end of input, rather than ^ and $: without MULTILINE those
+ * still normally coincide, except that Java's $ additionally matches just
+ * before a trailing line terminator, and Java's definition of line
+ * terminator includes U+0085 (NEL), U+2028, and U+2029, none of which
+ * JavaScript's \s treats as whitespace at all (\s and $ are two separate
+ * questions in JavaScript, and neither answers the other the way Java's $
+ * does here). A source file ending in ordinary whitespace immediately
+ * followed by a NEL would otherwise have that whitespace stripped here but
+ * not by the vendor mock's own trim(), producing a mismatch on an
+ * otherwise perfectly migrated file.
  */
 public final class OcrTextTransform {
 
     private static final String JS_WHITESPACE_CLASS =
             "[\\t\\n\\u000B\\f\\r\\u0020\\u00A0\\uFEFF\\u1680\\u2000-\\u200A\\u2028\\u2029\\u202F\\u205F\\u3000]";
     private static final Pattern WHITESPACE_RUN = Pattern.compile(JS_WHITESPACE_CLASS + "+");
-    private static final Pattern LEADING_WHITESPACE = Pattern.compile("^" + JS_WHITESPACE_CLASS + "+");
-    private static final Pattern TRAILING_WHITESPACE = Pattern.compile(JS_WHITESPACE_CLASS + "+$");
+    private static final Pattern LEADING_WHITESPACE = Pattern.compile("\\A" + JS_WHITESPACE_CLASS + "+");
+    private static final Pattern TRAILING_WHITESPACE = Pattern.compile(JS_WHITESPACE_CLASS + "+\\z");
 
     private OcrTextTransform() {
     }

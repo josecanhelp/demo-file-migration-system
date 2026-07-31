@@ -15,19 +15,21 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
  * mirror, which would otherwise make the reconciler flag a perfectly good
  * migration as corrupt.
  *
- * Every whitespace code point outside plain ASCII is written as an
- * explicit unicode escape rather than a literal character, so the
- * invisible or easily-mangled ones (NBSP, BOM, line/paragraph separator)
- * are unambiguous in source rather than relying on an editor or file
- * encoding to preserve them correctly.
+ * Every whitespace code point outside plain ASCII below is written as an
+ * explicit unicode escape (backslash, u, four hex digits) rather than a
+ * literal character: this source file is plain ASCII throughout, and
+ * NBSP, BOM, NEL, and the line/paragraph separators are produced by the
+ * Java compiler's own unicode escape handling (JLS 3.3), not by whatever
+ * an editor or file encoding happened to preserve.
  */
 class OcrTextTransformTest {
 
-    private static final String NBSP = " ";
-    private static final String BOM = "﻿";
-    private static final String LINE_SEPARATOR = " ";
-    private static final String PARAGRAPH_SEPARATOR = " ";
-    private static final String IDEOGRAPHIC_SPACE = "　";
+    private static final String NBSP = "\u00A0";
+    private static final String BOM = "\uFEFF";
+    private static final String LINE_SEPARATOR = "\u2028";
+    private static final String PARAGRAPH_SEPARATOR = "\u2029";
+    private static final String IDEOGRAPHIC_SPACE = "\u3000";
+    private static final String NEL = "\u0085";
 
     @Test
     void collapsesMultipleSpacesToOne() {
@@ -111,7 +113,21 @@ class OcrTextTransformTest {
 
     @Test
     void nonAsciiTextIsUpperCasedAndPreservedAcrossMultiByteCharacters() {
-        assertEquals("CAFÉ ÜBER 日本語", extract("café  über\t日本語"));
+        assertEquals("CAF\u00C9 \u00DCBER \u65E5\u672C\u8A9E", extract("caf\u00E9  \u00FCber\t\u65E5\u672C\u8A9E"));
+    }
+
+    /**
+     * Reproduces the reviewer's byte-level check directly: input codepoints
+     * [97,98,99,32,133] ("abc" + space + NEL). Java's regex $ anchor treats
+     * U+0085 (NEL) as a line terminator and would let a naive trailing-strip
+     * match and remove the space just before it; JavaScript's \s and trim()
+     * do not treat NEL as whitespace at all, so the space immediately
+     * before it is never reached, let alone stripped. \z instead of $ is
+     * what keeps this transform agreeing with that.
+     */
+    @Test
+    void trailingSpaceBeforeANextLineCharacterIsNotStrippedMatchingJavaScript() {
+        assertEquals("ABC " + NEL, extract("abc" + " " + NEL));
     }
 
     private static String extract(String text) {

@@ -403,6 +403,44 @@ public class LedgerRepository {
     }
 
     /**
+     * One page of source ids currently tracked in migration_state, ordered
+     * ascending, starting strictly after afterId. Used by the reconciler
+     * to walk the whole ledger table in fixed-size pages looking for a row
+     * with no matching source id, without loading every row into memory
+     * at once.
+     */
+    public List<Long> findIdsPage(long afterId, int limit) {
+        return targetJdbc.query(
+                "SELECT source_id FROM migration_state WHERE source_id > ? ORDER BY source_id LIMIT ?",
+                (rs, rowNum) -> rs.getLong("source_id"), afterId, limit);
+    }
+
+    /**
+     * Which of the given ids currently have a migration_state row. Used
+     * by the reconciler to find a source id with no ledger row at all.
+     */
+    public List<Long> existingIdsAmong(List<Long> ids) {
+        if (ids == null || ids.isEmpty()) {
+            return Collections.emptyList();
+        }
+        Long[] idArray = ids.toArray(new Long[0]);
+        return targetJdbc.execute((ConnectionCallback<List<Long>>) connection -> {
+            Array sqlArray = connection.createArrayOf("bigint", idArray);
+            String sql = "SELECT source_id FROM migration_state WHERE source_id = ANY(?)";
+            try (PreparedStatement ps = connection.prepareStatement(sql)) {
+                ps.setArray(1, sqlArray);
+                try (ResultSet rs = ps.executeQuery()) {
+                    List<Long> existing = new ArrayList<>();
+                    while (rs.next()) {
+                        existing.add(rs.getLong("source_id"));
+                    }
+                    return existing;
+                }
+            }
+        });
+    }
+
+    /**
      * Every id whose current status is FAILED_PERMANENT, with the error
      * recorded on that row. Reads migration_state directly rather than
      * migration_event: resetForUpdate can revive a FAILED_PERMANENT row
