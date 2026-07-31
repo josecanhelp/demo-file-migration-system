@@ -13,11 +13,15 @@ import com.filemigration.vendor.VendorClient;
 import com.filemigration.worker.BackfillConsumer;
 import com.filemigration.worker.MigrationService;
 import com.zaxxer.hikari.HikariDataSource;
+import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.admin.AdminClientConfig;
+import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.common.errors.TopicExistsException;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.junit.jupiter.api.AfterAll;
@@ -47,6 +51,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -83,7 +89,10 @@ class BackfillIT {
     private static final long LEDGER_LEASE_SECONDS = 300L;
     private static final long CHECKPOINT_LEASE_SECONDS = 300L;
     private static final String TOPIC = "files.backfill.it";
+    private static final int TEST_TOPIC_PARTITIONS = 1;
     private static final int TEST_VENDOR_BATCH_SIZE = 2;
+    private static final long PLAN_INTERVAL_SECONDS = 30L;
+    private static final long NACK_BACKOFF_SECONDS = 30L;
 
     private static HikariDataSource targetDataSource;
     private static HikariDataSource sourceDataSource;
@@ -98,7 +107,7 @@ class BackfillIT {
     private static ObjectMapper objectMapper;
 
     @BeforeAll
-    static void connect() {
+    static void connect() throws Exception {
         String targetUrl = System.getenv().getOrDefault("TARGET_JDBC_URL",
                 "jdbc:postgresql://localhost:5432/targetdb");
         String targetUser = System.getenv().getOrDefault("TARGET_JDBC_USERNAME", "postgres");
@@ -164,6 +173,7 @@ class BackfillIT {
                 CHECKPOINT_LEASE_SECONDS);
 
         String kafkaBootstrapServers = System.getenv().getOrDefault("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092");
+        ensureTopicExists(kafkaBootstrapServers);
         Map<String, Object> producerProps = Map.of(
                 ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaBootstrapServers,
                 ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
@@ -172,8 +182,8 @@ class BackfillIT {
         kafkaTemplate = new KafkaTemplate<>(producerFactory);
 
         coordinator = new BackfillCoordinator(sourceRepo, checkpointRepo, ledger, eventRepo, kafkaTemplate,
-                objectMapper, 1000L, TEST_VENDOR_BATCH_SIZE, TOPIC);
-        consumer = new BackfillConsumer(migrationService, ledger, objectMapper);
+                objectMapper, 1000L, TEST_VENDOR_BATCH_SIZE, TOPIC, PLAN_INTERVAL_SECONDS);
+        consumer = new BackfillConsumer(migrationService, ledger, objectMapper, NACK_BACKOFF_SECONDS);
     }
 
     @AfterAll
@@ -306,5 +316,24 @@ class BackfillIT {
 
     private static void setVendorMode(String mode) {
         vendorAdminClient.post().uri("/admin/mode").body(Map.of("mode", mode)).retrieve().toBodilessEntity();
+    }
+
+    /**
+     * Creates this test's own topic if it does not already exist, rather
+     * than relying on broker auto-create to choose whatever partition
+     * count and configuration the broker happens to default to.
+     * Tolerates the topic already existing from an earlier run.
+     */
+    private static void ensureTopicExists(String bootstrapServers) throws Exception {
+        Map<String, Object> adminProps = Map.of(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+        try (Admin admin = Admin.create(adminProps)) {
+            admin.createTopics(List.of(new NewTopic(TOPIC, TEST_TOPIC_PARTITIONS, (short) 1)))
+                    .all()
+                    .get(30, TimeUnit.SECONDS);
+        } catch (ExecutionException e) {
+            if (!(e.getCause() instanceof TopicExistsException)) {
+                throw e;
+            }
+        }
     }
 }

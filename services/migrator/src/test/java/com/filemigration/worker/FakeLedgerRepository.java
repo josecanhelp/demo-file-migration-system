@@ -92,6 +92,18 @@ class FakeLedgerRepository extends LedgerRepository {
         row.lastError = error;
     }
 
+    @Override
+    public List<Long> findUnresolved(List<Long> ids) {
+        List<Long> unresolved = new ArrayList<>();
+        for (Long id : ids) {
+            Status status = statusOf(id);
+            if (status != Status.DONE && status != Status.FAILED_PERMANENT) {
+                unresolved.add(id);
+            }
+        }
+        return unresolved;
+    }
+
     private static final class Row {
         private Status status;
         private String ocrPayload;

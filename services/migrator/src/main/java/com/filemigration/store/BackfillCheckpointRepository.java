@@ -21,15 +21,14 @@ import java.util.Optional;
 @Repository
 public class BackfillCheckpointRepository {
 
-    // Copied exactly: the SELECT ... FOR UPDATE SKIP LOCKED is what lets
-    // two coordinators run this at the same moment without either one
-    // blocking behind whichever row the other already has locked, since
-    // the loser simply skips that row and looks for a different one
-    // instead of waiting on it. Package-private, not private, so the
-    // integration test that proves this can run the identical statement
-    // directly against a deliberately held-open transaction rather than
-    // keeping a second copy of this text that could drift from the real
-    // one.
+    // The SELECT ... FOR UPDATE SKIP LOCKED is what lets two coordinators
+    // run this at the same moment without either one blocking behind
+    // whichever row the other already has locked, since the loser simply
+    // skips that row and looks for a different one instead of waiting on
+    // it. Package-private, not private, so a test can run this identical
+    // statement directly against a deliberately held-open transaction
+    // rather than keeping a second copy of this text that could drift
+    // from the real one.
     static final String CLAIM_SQL =
             "UPDATE backfill_checkpoint SET status='CLAIMED', claimed_at=now()\n"
             + " WHERE (range_start, range_end) = (\n"

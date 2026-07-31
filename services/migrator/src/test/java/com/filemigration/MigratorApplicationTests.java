@@ -14,9 +14,14 @@ import org.springframework.test.context.ActiveProfiles;
  * network: the backfill consumer's listener container needs an address
  * it can resolve to start up, but actually reaching a broker only happens
  * later, on its background poll thread, so no running Kafka is needed
- * here either.
+ * here either. The admin operation timeout is shortened for this test
+ * only, so the topic-check call that has nothing to talk to gives up in
+ * a couple of seconds instead of the full production timeout.
  */
-@SpringBootTest(properties = "spring.kafka.bootstrap-servers=localhost:19092")
+@SpringBootTest(properties = {
+        "spring.kafka.bootstrap-servers=localhost:19092",
+        "spring.kafka.admin.operation-timeout=2s"
+})
 @ActiveProfiles("worker")
 class MigratorApplicationTests {
 

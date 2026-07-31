@@ -8,7 +8,7 @@ spring:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:kafka:9092}
     admin:
       fail-fast: false
-      operation-timeout: 3
+      operation-timeout: 30s
     consumer:
       enable-auto-commit: false
       auto-offset-reset: earliest
@@ -27,6 +27,8 @@ migrator:
   backfill:
     range-size: ${BACKFILL_RANGE_SIZE:1000}
     range-lease-seconds: ${BACKFILL_RANGE_LEASE_SECONDS:300}
+    plan-interval-seconds: ${BACKFILL_PLAN_INTERVAL_SECONDS:30}
+    nack-backoff-seconds: ${BACKFILL_NACK_BACKOFF_SECONDS:30}
     topic: files.backfill
     topic-partitions: ${BACKFILL_TOPIC_PARTITIONS:3}
     group-id: backfill

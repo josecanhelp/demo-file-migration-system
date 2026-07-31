@@ -29,11 +29,13 @@ import java.util.concurrent.TimeoutException;
 /**
  * Divides the source table into fixed-size id ranges, seeds a ledger row
  * for every id in each range, and publishes those ids to the backfill
- * topic in vendor-sized chunks. Runs once per process lifetime: after
- * every range has been planned and either already DONE or successfully
- * claimed and published, the planning loop stops and logs that it is
- * finished, but the process itself keeps running so its health endpoint
- * keeps answering.
+ * topic in vendor-sized chunks. Runs for the life of the process: it
+ * repeatedly checks how far the source table has grown, plans any ranges
+ * that do not exist yet, drains every claimable range it finds, and then
+ * sleeps for a configured interval before checking again. This is what
+ * lets a source table that is still empty, or still being seeded, when
+ * the coordinator starts catch up on its own the moment rows show up,
+ * with no restart needed.
  *
  * Planning happens on a background thread rather than during startup, so
  * a source table large enough to take a while to plan does not hold up
@@ -56,13 +58,15 @@ public class BackfillCoordinator {
     private final long rangeSize;
     private final int vendorBatchSize;
     private final String topic;
+    private final long planIntervalSeconds;
 
     public BackfillCoordinator(SourceFileRepository sourceRepo, BackfillCheckpointRepository checkpointRepo,
             LedgerRepository ledger, EventRepository eventRepo, KafkaTemplate<String, String> kafkaTemplate,
             ObjectMapper objectMapper,
             @Value("${migrator.backfill.range-size}") long rangeSize,
             @Value("${migrator.vendor.batch-size}") int vendorBatchSize,
-            @Value("${migrator.backfill.topic}") String topic) {
+            @Value("${migrator.backfill.topic}") String topic,
+            @Value("${migrator.backfill.plan-interval-seconds}") long planIntervalSeconds) {
         this.sourceRepo = sourceRepo;
         this.checkpointRepo = checkpointRepo;
         this.ledger = ledger;
@@ -72,42 +76,60 @@ public class BackfillCoordinator {
         this.rangeSize = rangeSize;
         this.vendorBatchSize = vendorBatchSize;
         this.topic = topic;
+        this.planIntervalSeconds = planIntervalSeconds;
     }
 
     @EventListener(ApplicationReadyEvent.class)
     public void onReady() {
-        Thread planningThread = new Thread(this::planAndPublish, "backfill-coordinator");
+        Thread planningThread = new Thread(this::runPlanningLoop, "backfill-coordinator");
         planningThread.setDaemon(true);
         planningThread.start();
     }
 
-    private void planAndPublish() {
+    private void runPlanningLoop() {
+        while (true) {
+            try {
+                planAndDrainOnce();
+            } catch (RuntimeException e) {
+                // A range left CLAIMED here is not lost: once its lease
+                // expires it becomes claimable again on a later pass of
+                // this same loop.
+                log.error("A backfill range failed; it will become reclaimable once its lease expires and a "
+                        + "later planning pass will retry it", e);
+            }
+            sleepInterval();
+        }
+    }
+
+    private void planAndDrainOnce() {
         long maxId = sourceRepo.maxId();
         if (maxId <= 0) {
-            log.info("Source table has no rows yet, backfill coordinator has nothing to plan and will idle");
+            log.info("Source table has no rows yet; backfill coordinator will check again in {}s",
+                    planIntervalSeconds);
             return;
         }
 
         int plannedRanges = checkpointRepo.planRanges(maxId, rangeSize);
-        log.info("Backfill planning covers ids 1 through {}, inserted {} new range(s)", maxId, plannedRanges);
+        if (plannedRanges > 0) {
+            log.info("Backfill planning covers ids 1 through {}, inserted {} new range(s)", maxId, plannedRanges);
+        }
 
-        try {
-            while (true) {
-                checkpointRepo.reapExpiredClaims();
-                Optional<BackfillRange> claimed = checkpointRepo.claimNextRange();
-                if (claimed.isEmpty()) {
-                    log.info("backfill planning complete");
-                    return;
-                }
-                processRange(claimed.get());
+        while (true) {
+            checkpointRepo.reapExpiredClaims();
+            Optional<BackfillRange> claimed = checkpointRepo.claimNextRange();
+            if (claimed.isEmpty()) {
+                break;
             }
-        } catch (RuntimeException e) {
-            // A range left CLAIMED here is not lost: once its lease
-            // expires it becomes claimable again, by this process on a
-            // future pass if one ever runs, or by a fresh one after a
-            // restart.
-            log.error("Backfill planning stopped after a range failed; it will become reclaimable once its "
-                    + "lease expires", e);
+            processRange(claimed.get());
+        }
+        log.info("backfill planning complete, checking again in {}s", planIntervalSeconds);
+    }
+
+    private void sleepInterval() {
+        try {
+            TimeUnit.SECONDS.sleep(planIntervalSeconds);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 

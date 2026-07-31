@@ -104,24 +104,20 @@ class BackfillCheckpointRepositoryIT {
     }
 
     /**
-     * A plain two-thread race releasing from a latch was tried first and
-     * kept passing even with FOR UPDATE SKIP LOCKED deleted from
-     * CLAIM_SQL entirely: Postgres's own row-versioning already stops a
-     * second autocommit UPDATE from double-assigning a row a first one
-     * just committed, so two independent statements landing microseconds
-     * apart essentially never both observe the row as available at once.
-     * That is not what SKIP LOCKED is for. What it actually buys is not
-     * blocking behind a row a concurrent transaction has locked but not
-     * yet committed, so this test forces exactly that: it holds an
-     * uncommitted claim open on the only pending range on a separate,
-     * manually-controlled connection, then proves a second, ordinary
-     * claimNextRange() call comes back empty (not a match, since the only
-     * row is locked) essentially immediately, rather than sitting there
-     * until the first transaction finishes. With SKIP LOCKED deleted,
-     * rerunning this test reliably made the second call block for the
-     * whole time the first transaction stayed open instead of returning
-     * right away, which is what the timing assertion below catches. That
-     * deliberate break was reverted immediately after confirming it.
+     * Postgres's own row-versioning already stops a second, independent
+     * autocommit UPDATE from double-assigning a row a first one just
+     * committed, so a plain two-thread race releasing from a latch cannot
+     * tell a claim query with FOR UPDATE SKIP LOCKED apart from one
+     * without it: two such statements landing microseconds apart
+     * essentially never both observe the same row as available at once
+     * either way. What SKIP LOCKED actually buys is not blocking behind a
+     * row a concurrent transaction has locked but not yet committed, so
+     * this test forces exactly that: it holds an uncommitted claim open
+     * on the only pending range on a separate, manually-controlled
+     * connection, then proves a second, ordinary claimNextRange() call
+     * comes back empty (not a match, since the only row is locked)
+     * essentially immediately, rather than sitting there until the first
+     * transaction finishes.
      */
     @Test
     void claimDoesNotBlockOnARangeAnUncommittedTransactionAlreadyHasLocked() throws Exception {
