@@ -15,8 +15,10 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -64,6 +66,7 @@ class MigrationServiceTest {
 
     @Test
     void cachedOcrPayloadSkipsVendorOnRetryAfterCrash() throws Exception {
+        byte[] content = "INVOICE 00000001".getBytes(StandardCharsets.UTF_8);
         seedPending(1L, "invoice.txt", "INVOICE 00000001");
         String cachedPayload = new ObjectMapper().writeValueAsString(
                 new OcrResult(1L, "INVOICE 00000001", 0.97, 1, "job-1"));
@@ -76,6 +79,9 @@ class MigrationServiceTest {
         assertEquals(Status.DONE, ledger.statusOf(1L));
         assertEquals(1, documentRepo.documentCount());
         assertEquals("INVOICE 00000001", documentRepo.get(1L).ocrText());
+        assertEquals(1, objectStore.putCount(),
+                "the cached path must still write the blob, so the checksum matches what is stored");
+        assertArrayEquals(content, objectStore.get("files/1"));
     }
 
     @Test
@@ -121,6 +127,7 @@ class MigrationServiceTest {
         assertEquals(Status.DONE, ledger.statusOf(1L));
         assertEquals(Status.DONE, ledger.statusOf(2L));
         assertEquals(2, documentRepo.documentCount());
+        assertEquals(2, objectStore.putCount(), "both the cached and the fresh file must have their blob written");
     }
 
     @Test
@@ -149,9 +156,86 @@ class MigrationServiceTest {
         assertEquals(1, eventRepo.countByStageAndId(Stage.STORED, 3L));
     }
 
+    @Test
+    void vendorShortResponseMarksTheMissingIdRetryableAndPreservesTheInvariant() {
+        seedPending(10L, "a.txt", "a content");
+        seedPending(11L, "b.txt", "b content");
+        vendorClient.omitFromResults(11L);
+
+        MigrationOutcome outcome = service.migrate(List.of(10L, 11L), "backfill");
+
+        assertEquals(1, outcome.done());
+        assertEquals(0, outcome.skipped());
+        assertEquals(0, outcome.permanentFailures());
+        assertEquals(1, outcome.retryable());
+        assertInvariant(2, outcome);
+        assertEquals(Status.DONE, ledger.statusOf(10L));
+        assertEquals(Status.FAILED_RETRYABLE, ledger.statusOf(11L));
+        assertEquals(1, eventRepo.countByStageAndId(Stage.RETRY, 11L));
+    }
+
+    @Test
+    void sourceRecordMissingForANeedsOcrIdIsMarkedRetryableAndPreservesTheInvariant() {
+        ledger.presetPending(20L);
+        seedPending(21L, "b.txt", "b content");
+
+        MigrationOutcome outcome = service.migrate(List.of(20L, 21L), "backfill");
+
+        assertEquals(1, outcome.done());
+        assertEquals(1, outcome.retryable());
+        assertInvariant(2, outcome);
+        assertEquals(Status.FAILED_RETRYABLE, ledger.statusOf(20L));
+        assertEquals(1, eventRepo.countByStageAndId(Stage.RETRY, 20L));
+        assertEquals(1, vendorClient.callCount());
+        assertFalse(vendorClient.idsFromCall(0).contains(20L),
+                "an id missing its source record must never reach the vendor");
+    }
+
+    @Test
+    void sourceRecordMissingForACachedIdIsMarkedRetryableAndPreservesTheInvariant() throws Exception {
+        String cachedPayload = new ObjectMapper().writeValueAsString(
+                new OcrResult(30L, "stale", 0.9, 1, "job-30"));
+        ledger.presetState(30L, Status.OCR_DONE, cachedPayload);
+
+        MigrationOutcome outcome = service.migrate(List.of(30L), "backfill");
+
+        assertEquals(0, outcome.done());
+        assertEquals(1, outcome.retryable());
+        assertInvariant(1, outcome);
+        assertEquals(Status.FAILED_RETRYABLE, ledger.statusOf(30L));
+        assertEquals(0, vendorClient.callCount());
+    }
+
+    @Test
+    void permanentFailureIsolatesThePoisonFileAndFinishesTheRestOfTheBatch() {
+        seedPending(40L, "a.txt", "good a");
+        seedPending(41L, "poison.txt", "bad");
+        seedPending(42L, "c.txt", "good c");
+        vendorClient.markPoison(41L);
+
+        MigrationOutcome outcome = service.migrate(List.of(40L, 41L, 42L), "backfill");
+
+        assertEquals(2, outcome.done());
+        assertEquals(1, outcome.permanentFailures());
+        assertEquals(0, outcome.retryable());
+        assertInvariant(3, outcome);
+        assertEquals(Status.DONE, ledger.statusOf(40L));
+        assertEquals(Status.FAILED_PERMANENT, ledger.statusOf(41L));
+        assertEquals(Status.DONE, ledger.statusOf(42L));
+        assertEquals(1, eventRepo.countByStageAndId(Stage.DLQ, 41L));
+        assertNull(documentRepo.get(41L), "the poisoned file must never get a document row");
+        assertEquals(4, vendorClient.callCount(), "one whole-batch call plus one isolating retry per file");
+    }
+
     private void seedPending(long id, String filename, String text) {
         byte[] content = text.getBytes(StandardCharsets.UTF_8);
         sourceRepo.put(new FileRecord(id, filename, "text/plain", content, content.length, Instant.now()));
         ledger.presetPending(id);
+    }
+
+    private static void assertInvariant(int totalRequested, MigrationOutcome outcome) {
+        assertEquals(totalRequested,
+                outcome.done() + outcome.skipped() + outcome.permanentFailures() + outcome.retryable(),
+                "every id passed to migrate must be accounted for exactly once");
     }
 }

@@ -54,6 +54,7 @@ class MigrationServiceIT {
 
     private static final long BASE_ID = 9_000_000L;
     private static final String BUCKET = "documents";
+    private static final long LEASE_SECONDS = 300L;
 
     private static HikariDataSource targetDataSource;
     private static HikariDataSource sourceDataSource;
@@ -118,7 +119,7 @@ class MigrationServiceIT {
                 .build();
 
         ObjectMapper objectMapper = new ObjectMapper();
-        LedgerRepository ledger = new LedgerRepository(targetJdbc);
+        LedgerRepository ledger = new LedgerRepository(targetJdbc, LEASE_SECONDS);
         SourceFileRepository sourceRepo = new SourceFileRepository(sourceJdbc);
         ObjectStore objectStore = new ObjectStore(s3Client, BUCKET);
         DocumentRepository documentRepo = new DocumentRepository(targetJdbc);
@@ -203,8 +204,11 @@ class MigrationServiceIT {
                 .build(), RequestBody.fromBytes(content));
         String cachedPayload = new ObjectMapper().writeValueAsString(
                 new OcrResult(id, "PRE-COMPUTED OCR", 0.95, 1, "job-resumed"));
-        targetJdbc.update("UPDATE migration_state SET status = 'OCR_DONE', ocr_payload = ?::jsonb "
-                + "WHERE source_id = ?", cachedPayload, id);
+        // Backdate updated_at so this row's claim lease reads as expired,
+        // matching what a real crash-then-resume looks like instead of a
+        // worker still actively holding the row.
+        targetJdbc.update("UPDATE migration_state SET status = 'OCR_DONE', ocr_payload = ?::jsonb, "
+                + "updated_at = now() - interval '1 hour' WHERE source_id = ?", cachedPayload, id);
 
         MigrationOutcome outcome = service.migrate(List.of(id), "backfill");
 
@@ -224,7 +228,7 @@ class MigrationServiceIT {
     }
 
     private void seedPending(long id, String lane) {
-        LedgerRepository ledger = new LedgerRepository(targetJdbc);
+        LedgerRepository ledger = new LedgerRepository(targetJdbc, LEASE_SECONDS);
         ledger.seedPending(List.of(id), lane, Map.of(id, Instant.now()));
     }
 

@@ -28,6 +28,11 @@ import java.util.Map;
  * it done, and write the result. The order these steps run in is what
  * lets a batch be resubmitted after a crash without paying for OCR twice
  * or writing a duplicate document row.
+ *
+ * Every id passed to {@link #migrate} lands in exactly one bucket of the
+ * returned outcome: done, skipped, permanently failed, or retryable.
+ * Nothing is ever left unaccounted for, since an id left untouched would
+ * stay IN_FLIGHT with no way for a later call to notice it needs help.
  */
 @Service
 public class MigrationService {
@@ -56,8 +61,10 @@ public class MigrationService {
      * Migrates the given source ids for the given lane. An id this call
      * does not own, because another worker already claimed it or it is
      * already done, is counted as skipped and touched nowhere else. Every
-     * id this call does own is either finished, or, if the vendor call
-     * for it fails, left claimable again for a later attempt.
+     * id this call does own is either finished, marked permanently
+     * failed, or marked retryable and left claimable again for a later
+     * attempt: done + skipped + permanentFailures + retryable always adds
+     * up to the number of ids passed in.
      */
     public MigrationOutcome migrate(List<Long> sourceIds, String lane) {
         List<Long> claimed = ledger.claim(sourceIds);
@@ -96,6 +103,8 @@ public class MigrationService {
         for (Long id : cachedIds) {
             FileRecord record = recordsById.get(id);
             if (record == null) {
+                markRetryable(id, "Source record no longer exists for a claimed id with a cached OCR payload", lane);
+                retryable++;
                 continue;
             }
             OcrResult cached = readOcrPayload(cachedPayloads.get(id));
@@ -107,9 +116,10 @@ public class MigrationService {
         for (Long id : needsOcr) {
             FileRecord record = recordsById.get(id);
             if (record == null) {
+                markRetryable(id, "Source record no longer exists for a claimed id", lane);
+                retryable++;
                 continue;
             }
-            objectStore.put(objectStore.keyFor(record.id()), record.content(), record.contentType());
             freshRecords.add(record);
         }
 
@@ -118,22 +128,27 @@ public class MigrationService {
             try {
                 results = vendorClient.ocrBatch(freshRecords);
             } catch (VendorException e) {
-                boolean permanent = e.errorClass() == ErrorClass.PERMANENT;
-                for (FileRecord record : freshRecords) {
-                    ledger.markFailed(record.id(), e.getMessage(), permanent);
-                    eventRepo.record(record.id(), permanent ? Stage.DLQ : Stage.RETRY, lane, null);
-                }
-                if (permanent) {
-                    permanentFailures += freshRecords.size();
+                if (e.errorClass() == ErrorClass.PERMANENT) {
+                    IsolationResult isolation = isolatePermanentFailure(freshRecords, lane);
+                    done += isolation.done();
+                    permanentFailures += isolation.permanentFailures();
+                    retryable += isolation.retryable();
+                    if (isolation.toRethrow() != null) {
+                        throw isolation.toRethrow();
+                    }
                     return new MigrationOutcome(done, skipped, permanentFailures, retryable);
                 }
-                retryable += freshRecords.size();
+                for (FileRecord record : freshRecords) {
+                    markRetryable(record.id(), e.getMessage(), lane);
+                }
                 throw e;
             }
 
             for (FileRecord record : freshRecords) {
                 OcrResult result = results.get(record.id());
                 if (result == null) {
+                    markRetryable(record.id(), "Vendor response did not include a result for this id", lane);
+                    retryable++;
                     continue;
                 }
                 ledger.saveOcrPayload(record.id(), writeOcrPayload(result));
@@ -146,9 +161,74 @@ public class MigrationService {
         return new MigrationOutcome(done, skipped, permanentFailures, retryable);
     }
 
+    /**
+     * Handles a PERMANENT vendor error for a batch that held more than one
+     * file. The real vendor rejects the whole HTTP call the moment any one
+     * document in it is unprocessable, so the batch is re-sent one file at
+     * a time to find out which one is actually poison rather than
+     * condemning every file that happened to share the request. A batch of
+     * exactly one file is already isolated, so it is failed directly
+     * without a second call. If an individual retry comes back with
+     * anything other than PERMANENT, that file and every file not yet
+     * retried are marked retryable and the exception is handed back to the
+     * caller to rethrow, since only PERMANENT is ever safe to absorb here.
+     */
+    private IsolationResult isolatePermanentFailure(List<FileRecord> freshRecords, String lane) {
+        if (freshRecords.size() == 1) {
+            FileRecord record = freshRecords.get(0);
+            ledger.markFailed(record.id(), "Vendor rejected this file", true);
+            eventRepo.record(record.id(), Stage.DLQ, lane, null);
+            return new IsolationResult(0, 1, 0, null);
+        }
+
+        int done = 0;
+        int permanentFailures = 0;
+        int retryable = 0;
+        for (int i = 0; i < freshRecords.size(); i++) {
+            FileRecord record = freshRecords.get(i);
+            Map<Long, OcrResult> singleResult;
+            try {
+                singleResult = vendorClient.ocrBatch(List.of(record));
+            } catch (VendorException individual) {
+                if (individual.errorClass() != ErrorClass.PERMANENT) {
+                    for (int j = i; j < freshRecords.size(); j++) {
+                        markRetryable(freshRecords.get(j).id(), individual.getMessage(), lane);
+                        retryable++;
+                    }
+                    return new IsolationResult(done, permanentFailures, retryable, individual);
+                }
+                ledger.markFailed(record.id(), individual.getMessage(), true);
+                eventRepo.record(record.id(), Stage.DLQ, lane, null);
+                permanentFailures++;
+                continue;
+            }
+            OcrResult result = singleResult.get(record.id());
+            if (result == null) {
+                markRetryable(record.id(), "Vendor response did not include a result for this id", lane);
+                retryable++;
+                continue;
+            }
+            ledger.saveOcrPayload(record.id(), writeOcrPayload(result));
+            eventRepo.record(record.id(), Stage.OCR_DONE, lane, null);
+            finishDocument(record, result, lane);
+            done++;
+        }
+        return new IsolationResult(done, permanentFailures, retryable, null);
+    }
+
+    private void markRetryable(long id, String message, String lane) {
+        ledger.markFailed(id, message, false);
+        eventRepo.record(id, Stage.RETRY, lane, null);
+    }
+
     private void finishDocument(FileRecord record, OcrResult ocr, String lane) {
-        String checksum = sha256Hex(record.content());
         String objectKey = objectStore.keyFor(record.id());
+        // Written unconditionally, cached OCR result or not, so the
+        // checksum below always describes the bytes that just landed in
+        // the object store rather than an assumption about what an
+        // earlier attempt may have stored there.
+        objectStore.put(objectKey, record.content(), record.contentType());
+        String checksum = sha256Hex(record.content());
         documentRepo.upsert(record.id(), record.filename(), record.contentType(), objectKey, record.byteSize(),
                 checksum, ocr.text(), ocr.confidence(), ocr.pageCount(), ocr.jobId());
         ledger.markDone(record.id(), checksum);
@@ -183,5 +263,15 @@ public class MigrationService {
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException("SHA-256 is not available", e);
         }
+    }
+
+    /**
+     * Running tally from isolating a poisoned batch: how many files were
+     * finished, how many were individually condemned, how many were
+     * marked retryable, and, if isolation had to stop early because an
+     * individual retry came back with a non-permanent error, the
+     * exception the caller must rethrow.
+     */
+    private record IsolationResult(int done, int permanentFailures, int retryable, VendorException toRethrow) {
     }
 }

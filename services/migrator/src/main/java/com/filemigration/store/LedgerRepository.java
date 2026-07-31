@@ -2,6 +2,7 @@ package com.filemigration.store;
 
 import com.filemigration.model.Status;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.ConnectionCallback;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
@@ -20,37 +21,44 @@ import java.util.Map;
 
 /**
  * The migration_state table: one row per source file, tracking where it is
- * in the pipeline and guarding against two workers processing the same
- * file at once.
+ * in the pipeline. A claimed row is only safe from a second worker for as
+ * long as its lease lasts; once the lease expires the row becomes
+ * claimable again on the assumption that whatever held it crashed.
  */
 @Repository
 public class LedgerRepository {
 
-    // The RETURNING clause reports exactly which ids this statement moved
-    // into IN_FLIGHT. A row already IN_FLIGHT matches none of the statuses
-    // in the WHERE clause, so it is silently left out of the result
-    // instead of being claimed a second time. That is what lets several
-    // workers pull from the same batch of ids without two of them ever
-    // processing the same file at once.
+    // A row moves into IN_FLIGHT in one of two cases: it is new work
+    // (PENDING or FAILED_RETRYABLE), or it is already IN_FLIGHT or
+    // OCR_DONE but has sat there longer than its claim lease, meaning
+    // whatever worker had it has either crashed or long since finished
+    // without updating it. A row still within its lease is left alone, so
+    // a worker actively handling it is not interrupted mid-flight.
     //
-    // OCR_DONE is included alongside PENDING and FAILED_RETRYABLE because
-    // a row can sit at OCR_DONE with its ocr_payload already saved but no
-    // document row written yet, if a worker crashed after paying for OCR
-    // but before finishing the write to the target store. Letting that
-    // row be claimed again is what lets a later attempt pick it back up
-    // and finish it using the cached payload instead of calling the
-    // vendor a second time.
+    // This recovers from a crash at any point in the pipeline, not only
+    // the window right after saveOcrPayload, but it does not guarantee
+    // exactly one owner at every instant: nothing renews the lease while
+    // work is in progress, so a row whose lease happens to expire while a
+    // worker is still legitimately processing it can be claimed a second
+    // time. What it does guarantee is that no claimed file is ever
+    // stranded forever.
     private static final String CLAIM_SQL =
             "UPDATE migration_state\n"
             + "   SET status = 'IN_FLIGHT', attempts = attempts + 1, updated_at = now()\n"
             + " WHERE source_id = ANY(?)\n"
-            + "   AND status IN ('PENDING', 'FAILED_RETRYABLE', 'OCR_DONE')\n"
+            + "   AND (\n"
+            + "     status IN ('PENDING', 'FAILED_RETRYABLE')\n"
+            + "     OR (status IN ('IN_FLIGHT', 'OCR_DONE') AND updated_at < now() - make_interval(secs => ?))\n"
+            + "   )\n"
             + "RETURNING source_id";
 
     private final JdbcTemplate targetJdbc;
+    private final long claimLeaseSeconds;
 
-    public LedgerRepository(@Qualifier("targetJdbc") JdbcTemplate targetJdbc) {
+    public LedgerRepository(@Qualifier("targetJdbc") JdbcTemplate targetJdbc,
+            @Value("${migrator.claim-lease-seconds}") long claimLeaseSeconds) {
         this.targetJdbc = targetJdbc;
+        this.claimLeaseSeconds = claimLeaseSeconds;
     }
 
     /**
@@ -87,9 +95,10 @@ public class LedgerRepository {
     }
 
     /**
-     * Attempts to move each given id from PENDING, FAILED_RETRYABLE, or
-     * OCR_DONE into IN_FLIGHT. Only the ids this call actually
-     * transitioned come back; an id already claimed by another worker, or
+     * Attempts to move each given id into IN_FLIGHT: unconditionally for
+     * PENDING or FAILED_RETRYABLE rows, and for IN_FLIGHT or OCR_DONE rows
+     * whose claim lease has expired. Only the ids this call actually
+     * transitioned come back; an id currently owned by a live claim, or
      * already DONE, is silently dropped. Callers must treat the returned
      * list, not the input list, as the set of ids they now own.
      */
@@ -102,6 +111,7 @@ public class LedgerRepository {
             Array sqlArray = connection.createArrayOf("bigint", idArray);
             try (PreparedStatement ps = connection.prepareStatement(CLAIM_SQL)) {
                 ps.setArray(1, sqlArray);
+                ps.setLong(2, claimLeaseSeconds);
                 try (ResultSet rs = ps.executeQuery()) {
                     List<Long> claimed = new ArrayList<>();
                     while (rs.next()) {

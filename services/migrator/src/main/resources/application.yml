@@ -8,6 +8,7 @@ spring:
 migrator:
   worker-concurrency: ${WORKER_CONCURRENCY:8}
   db-pool-size: ${DB_POOL_SIZE:0}
+  claim-lease-seconds: ${CLAIM_LEASE_SECONDS:300}
   mysql:
     host: ${MYSQL_HOST:mysql}
     port: ${MYSQL_PORT:3306}

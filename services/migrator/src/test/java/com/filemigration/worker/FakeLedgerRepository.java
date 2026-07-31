@@ -12,14 +12,18 @@ import java.util.Map;
 /**
  * In-memory stand-in for LedgerRepository that mirrors the claimability
  * rules of the real migration_state table: a row is claimable while
- * PENDING, FAILED_RETRYABLE, or OCR_DONE, and is left alone otherwise.
+ * PENDING or FAILED_RETRYABLE, and OCR_DONE is treated as always
+ * claimable here to model a row whose claim lease has already expired
+ * after a crash. The real repository only reclaims an OCR_DONE or
+ * IN_FLIGHT row once its lease has actually expired, which is what
+ * LedgerRepositoryIT exercises against a real Postgres instance.
  */
 class FakeLedgerRepository extends LedgerRepository {
 
     private final Map<Long, Row> rows = new LinkedHashMap<>();
 
     FakeLedgerRepository() {
-        super(null);
+        super(null, 300L);
     }
 
     void presetState(long id, Status status, String ocrPayload) {

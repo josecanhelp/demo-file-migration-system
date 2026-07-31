@@ -30,6 +30,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class LedgerRepositoryIT {
 
     private static final long BASE_ID = 9_000_000L;
+    private static final long LEASE_SECONDS = 300L;
 
     private static HikariDataSource dataSource;
     private static JdbcTemplate jdbcTemplate;
@@ -54,7 +55,7 @@ class LedgerRepositoryIT {
         // not reachable, this throws and the whole class fails instead of
         // quietly reporting a pass with nothing exercised.
         jdbcTemplate.queryForObject("SELECT 1", Integer.class);
-        ledger = new LedgerRepository(jdbcTemplate);
+        ledger = new LedgerRepository(jdbcTemplate, LEASE_SECONDS);
     }
 
     @AfterAll
@@ -111,22 +112,49 @@ class LedgerRepositoryIT {
     }
 
     @Test
-    void ocrDoneRowWithCachedPayloadStaysClaimable() {
+    void ocrDoneRowWithCachedPayloadStaysClaimableOnceItsLeaseExpires() {
         long id = BASE_ID + 4;
         insertState(id, "backfill", "OCR_DONE", 1);
         jdbcTemplate.update(
-                "UPDATE migration_state SET ocr_payload = ?::jsonb WHERE source_id = ?",
+                "UPDATE migration_state SET ocr_payload = ?::jsonb, updated_at = now() - interval '1 hour' "
+                        + "WHERE source_id = ?",
                 "{\"id\":" + id + ",\"text\":\"hello\",\"confidence\":0.9,\"pageCount\":1,\"jobId\":\"job-1\"}", id);
 
         List<Long> claimed = ledger.claim(List.of(id));
 
-        assertEquals(List.of(id), claimed, "a row with a cached OCR payload must still be claimable");
+        assertEquals(List.of(id), claimed, "a row with a cached OCR payload must be claimable once its lease expires");
         Map<String, Object> row = jdbcTemplate.queryForMap(
                 "SELECT status, attempts, ocr_payload FROM migration_state WHERE source_id = ?", id);
         assertEquals("IN_FLIGHT", row.get("status"));
         assertEquals(2, row.get("attempts"));
         assertTrue(row.get("ocr_payload").toString().contains("hello"),
                 "claiming an OCR_DONE row must not disturb its cached payload");
+    }
+
+    @Test
+    void freshInFlightRowIsNotClaimableWithinItsLease() {
+        long id = BASE_ID + 7;
+        insertState(id, "cdc", "IN_FLIGHT", 1);
+
+        List<Long> claimed = ledger.claim(List.of(id));
+
+        assertTrue(claimed.isEmpty(), "a row still within its claim lease must not be claimable");
+    }
+
+    @Test
+    void inFlightRowPastItsLeaseBecomesClaimableAgain() {
+        long id = BASE_ID + 8;
+        insertState(id, "cdc", "IN_FLIGHT", 1);
+        jdbcTemplate.update("UPDATE migration_state SET updated_at = now() - interval '1 hour' "
+                + "WHERE source_id = ?", id);
+
+        List<Long> claimed = ledger.claim(List.of(id));
+
+        assertEquals(List.of(id), claimed, "a row whose claim lease has expired must be claimable again");
+        Map<String, Object> row = jdbcTemplate.queryForMap(
+                "SELECT status, attempts FROM migration_state WHERE source_id = ?", id);
+        assertEquals("IN_FLIGHT", row.get("status"));
+        assertEquals(2, row.get("attempts"));
     }
 
     @Test
