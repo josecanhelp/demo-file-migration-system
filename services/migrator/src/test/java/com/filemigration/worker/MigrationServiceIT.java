@@ -13,6 +13,7 @@ import com.zaxxer.hikari.HikariDataSource;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.jdbc.DataSourceBuilder;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
@@ -47,9 +48,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * for them.
  *
  * Every row this test writes uses a source id at or above the reserved
- * range below, and every one of those rows is removed after each test. If
- * any real dependency is unreachable, connecting fails loudly here rather
- * than being swallowed into a skip.
+ * range below, and every one of those rows is removed both before and
+ * after each test: every insert here is a plain INSERT on a fixed, reused
+ * source id rather than an upsert, so a row an earlier aborted or
+ * forcibly killed run left behind (its own @AfterEach never having
+ * gotten to run) would otherwise collide with this run's own insert on
+ * the same id instead of the test ever getting to run. If any real
+ * dependency is unreachable, connecting fails loudly here rather than
+ * being swallowed into a skip.
  */
 class MigrationServiceIT {
 
@@ -154,6 +160,7 @@ class MigrationServiceIT {
         }
     }
 
+    @BeforeEach
     @AfterEach
     void cleanUpReservedRows() {
         targetJdbc.update("DELETE FROM migration_event WHERE source_id >= ?", BASE_ID);

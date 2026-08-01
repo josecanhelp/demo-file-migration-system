@@ -242,9 +242,19 @@ services:
   # worker profile consumes the backfill topic and runs each batch of ids
   # through to a document row and object; the coordinator profile plans
   # backfill ranges and publishes their ids to that topic.
+  # No container_name here, unlike every other service: this is the one
+  # service `docker compose up --scale migrator-worker=N` runs more than
+  # one of, and a fixed name only works for exactly one container. The
+  # port mapping gives the container port with no host port, so Docker
+  # assigns each replica its own free ephemeral host port instead of every
+  # replica fighting over the same one; `docker compose port migrator-worker
+  # 8082` looks up whichever port a given replica actually landed on. Every
+  # other service in this file reaches migrator-worker by its internal
+  # service DNS name on 8082 instead, which Docker's embedded DNS resolves
+  # round-robin across however many replicas are running, so nothing inside
+  # the compose network depends on the host-side port at all.
   migrator-worker:
     build: ./services/migrator
-    container_name: migrator-worker
     restart: unless-stopped
     depends_on:
       mysql:
@@ -256,7 +266,7 @@ services:
       kafka:
         condition: service_healthy
     ports:
-      - "8082:8082"
+      - "8082"
     environment:
       SPRING_PROFILES_ACTIVE: worker
       SERVER_PORT: 8082

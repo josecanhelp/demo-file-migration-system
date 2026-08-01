@@ -5,6 +5,7 @@ import com.zaxxer.hikari.HikariDataSource;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.jdbc.DataSourceBuilder;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -37,8 +38,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * Every row this test writes uses a range_start at or above the reserved
  * value below, chosen far above anything the real range planner (which
  * always starts counting at 1) would ever produce for a source table of
- * any realistic size, and every one of those rows is removed after each
- * test.
+ * any realistic size, and every one of those rows is removed both before
+ * and after each test: every insert here is a plain INSERT on a fixed,
+ * reused range_start rather than an upsert, so a row an earlier aborted
+ * or forcibly killed run left behind (its own @AfterEach never having
+ * gotten to run) would otherwise collide with this run's own insert on
+ * the same range_start instead of the test ever getting to run.
  */
 class BackfillCheckpointRepositoryIT {
 
@@ -78,6 +83,7 @@ class BackfillCheckpointRepositoryIT {
         }
     }
 
+    @BeforeEach
     @AfterEach
     void cleanUpReservedRows() {
         jdbcTemplate.update("DELETE FROM backfill_checkpoint WHERE range_start >= ?", BASE_START);

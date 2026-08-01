@@ -28,6 +28,7 @@ import org.apache.kafka.common.serialization.StringSerializer;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.jdbc.DataSourceBuilder;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
@@ -72,8 +73,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * range below, which sits well clear of both the small ranges other
  * repository tests use and anything the real range planner (which starts
  * counting at 1) would produce for a modestly sized source table. Every
- * one of those rows is removed after each test, and the vendor is reset
- * to healthy after the class runs whether or not a test failed.
+ * one of those rows is removed both before and after each test: every
+ * insert here is a plain INSERT on a fixed, reused id rather than an
+ * upsert, so a row an earlier aborted or forcibly killed run left behind
+ * (its own @AfterEach never having gotten to run) would otherwise collide
+ * with this run's own insert on the same id instead of the test ever
+ * getting to run. The vendor is reset to healthy after the class runs
+ * whether or not a test failed.
  *
  * Publishing and consuming both use a topic of this test's own rather
  * than the real "files.backfill" topic the live coordinator and worker
@@ -216,6 +222,7 @@ class BackfillIT {
         }
     }
 
+    @BeforeEach
     @AfterEach
     void cleanUpReservedRows() {
         targetJdbc.update("DELETE FROM migration_event WHERE source_id >= ?", BASE_ID);

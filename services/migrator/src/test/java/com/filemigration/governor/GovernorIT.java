@@ -2,6 +2,7 @@ package com.filemigration.governor;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.filemigration.backfill.BackfillMessage;
+import com.filemigration.store.ObjectStore;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.AdminClientConfig;
@@ -66,7 +67,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *
  * Every id this test seeds uses its own reserved source id range, well
  * clear of every other IT's, and is removed after each test regardless of
- * outcome. The backfill, cdc, and dlq topics and consumer groups are
+ * outcome. That removal is also done before a test seeds an id, not only
+ * after: an aborted or forcibly killed run never gets to its own cleanup,
+ * and this class reuses the same fixed ids on every run rather than
+ * generating fresh ones, so a row left behind by a prior aborted run would
+ * otherwise collide with this run's own insert into migration_state on the
+ * very same id. The backfill, cdc, and dlq topics and consumer groups are
  * private to this test class, distinct from the real names the live
  * migrator-worker container uses, so this test never contends with, or
  * depends on the pace of, whatever that container is doing against the
@@ -132,6 +138,9 @@ class GovernorIT {
     @Autowired
     private CircuitBreaker vendorCircuitBreaker;
 
+    @Autowired
+    private ObjectStore objectStore;
+
     private static RestClient vendorAdminClient;
     private final List<Long> seededIds = new ArrayList<>();
 
@@ -143,24 +152,52 @@ class GovernorIT {
 
     @AfterEach
     void cleanUpAndRestoreSharedState() {
-        setVendorMode("healthy");
-        // The breaker and the listener containers are shared across every
-        // test method in this class (one Spring context for the whole
-        // class), so a test that drove the breaker OPEN must not leave it,
-        // or a paused container, behind for the next test to inherit.
-        waitUntil(() -> vendorCircuitBreaker.getState() == CircuitBreaker.State.CLOSED, RECOVERY_TIMEOUT,
-                "the vendor circuit breaker never returned to CLOSED after resetting the vendor to healthy");
-        waitUntil(() -> registry.getListenerContainers().stream().noneMatch(MessageListenerContainer::isPauseRequested),
-                RECOVERY_TIMEOUT, "a Kafka listener container never had its pause request cleared after the "
-                        + "breaker closed");
-
-        for (Long id : seededIds) {
-            targetJdbc.update("DELETE FROM migration_event WHERE source_id = ?", id);
-            targetJdbc.update("DELETE FROM document WHERE source_id = ?", id);
-            targetJdbc.update("DELETE FROM migration_state WHERE source_id = ?", id);
-            sourceJdbc.update("DELETE FROM files WHERE id = ?", id);
+        // The row cleanup below must run even if restoring the shared
+        // vendor/breaker/container state below fails or times out: that
+        // shared state is irrelevant to whether this method leaves rows
+        // behind for the next run to collide with, and a waitUntil
+        // failure here must never be the reason a leftover row survives
+        // to poison a later run the way an after-the-fact-only cleanup
+        // would.
+        try {
+            setVendorMode("healthy");
+            // The breaker and the listener containers are shared across
+            // every test method in this class (one Spring context for the
+            // whole class), so a test that drove the breaker OPEN must not
+            // leave it, or a paused container, behind for the next test to
+            // inherit.
+            waitUntil(() -> vendorCircuitBreaker.getState() == CircuitBreaker.State.CLOSED, RECOVERY_TIMEOUT,
+                    "the vendor circuit breaker never returned to CLOSED after resetting the vendor to healthy");
+            waitUntil(
+                    () -> registry.getListenerContainers().stream().noneMatch(MessageListenerContainer::isPauseRequested),
+                    RECOVERY_TIMEOUT, "a Kafka listener container never had its pause request cleared after the "
+                            + "breaker closed");
+        } finally {
+            for (Long id : seededIds) {
+                cleanRowsForId(id);
+            }
+            seededIds.clear();
         }
-        seededIds.clear();
+    }
+
+    /**
+     * Removes every row a seeded id could have left behind across every
+     * table and store this class touches: migration_event, document, and
+     * migration_state in the target Postgres, the source row in MySQL, and
+     * its MinIO object, if any. Called both before a test seeds an id (so
+     * a row an earlier aborted or forcibly killed run left behind, using
+     * the same fixed id this run is about to reuse, never collides with
+     * this run's own insert) and after, from cleanUpAndRestoreSharedState
+     * (so a normal run leaves nothing behind either). Deleting a row, or
+     * an object, that never existed is a no-op on every one of these
+     * stores, so this is safe to call unconditionally.
+     */
+    private void cleanRowsForId(long id) {
+        targetJdbc.update("DELETE FROM migration_event WHERE source_id = ?", id);
+        targetJdbc.update("DELETE FROM document WHERE source_id = ?", id);
+        targetJdbc.update("DELETE FROM migration_state WHERE source_id = ?", id);
+        sourceJdbc.update("DELETE FROM files WHERE id = ?", id);
+        objectStore.delete(objectStore.keyFor(id));
     }
 
     @AfterAll
@@ -295,6 +332,7 @@ class GovernorIT {
     void aFileUpdatedRepeatedlyWithEverySuccessIsNeverCondemnedByTheRetryCap() {
         long id = BASE_ID + 200;
         seededIds.add(id);
+        cleanRowsForId(id);
         insertSourceFile(id, "update-test.txt", "text/plain", "version 0".getBytes(StandardCharsets.UTF_8));
 
         publishCdcCreateEnvelope(id);
@@ -334,6 +372,7 @@ class GovernorIT {
     void genuinelyUnprocessableFileGoesToFailedPermanentAfterOneAttemptWithoutTrippingTheBreaker() {
         long id = BASE_ID + 900;
         seededIds.add(id);
+        cleanRowsForId(id);
         insertSourceFile(id, "empty.txt", "text/plain", new byte[0]);
         targetJdbc.update("INSERT INTO migration_state (source_id, lane, status) VALUES (?, ?, ?)",
                 id, "backfill", "PENDING");
@@ -374,6 +413,7 @@ class GovernorIT {
     void wedgeIdWithNoMatchingSourceRowReachesFailedPermanentWithinTheRetryCapInsteadOfNackingForever() {
         long id = BASE_ID + 950;
         seededIds.add(id);
+        cleanRowsForId(id);
         // Deliberately no insertSourceFile(id, ...): the MySQL row for
         // this id is never created, mirroring a row that has already been
         // deleted from the source by the time its change event is
@@ -411,6 +451,7 @@ class GovernorIT {
     void wedgeUpdateEnvelopeWithNoMatchingSourceRowReachesFailedPermanentWithinTheRetryCapInsteadOfNackingForever() {
         long id = BASE_ID + 970;
         seededIds.add(id);
+        cleanRowsForId(id);
         // Deliberately no insertSourceFile(id, ...): mirrors a source row
         // already gone by the time this update envelope is processed.
 
@@ -434,6 +475,13 @@ class GovernorIT {
             long id = BASE_ID + offset + i;
             ids.add(id);
             seededIds.add(id);
+            // Idempotent seeding: a prior run that was aborted before its
+            // own @AfterEach ran could have left a row behind on this exact
+            // id, since every run reuses the same fixed ids rather than
+            // generating fresh ones. Without this, the INSERT below would
+            // fail with a duplicate key on migration_state instead of this
+            // test ever getting to run.
+            cleanRowsForId(id);
             insertSourceFile(id, "outage-" + id + ".txt", "text/plain",
                     ("GOVERNOR IT " + id).getBytes(StandardCharsets.UTF_8));
             targetJdbc.update("INSERT INTO migration_state (source_id, lane, status) VALUES (?, ?, ?)",

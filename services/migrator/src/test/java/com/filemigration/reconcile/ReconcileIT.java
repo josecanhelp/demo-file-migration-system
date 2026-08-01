@@ -33,10 +33,11 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Exercises the reconciler against the real migrator-worker process and the
- * real Postgres, MySQL, and MinIO docker compose starts, proving it can
- * both report a clean migration and catch the corruption each test below
- * introduces on purpose: a stale checksum column, OCR text that no longer
+ * Exercises the reconciler through the control plane's HTTP proxy, the real
+ * migrator-worker process it forwards to, and the real Postgres, MySQL, and
+ * MinIO docker compose starts, proving it can both report a clean migration
+ * and catch the corruption each test below introduces on purpose: a stale
+ * checksum column, OCR text that no longer
  * matches the source, a document row's object missing from the store
  * entirely, a document row's object present but holding the wrong bytes, a
  * source row with no matching document row on its own (breaking the raw
@@ -82,7 +83,8 @@ class ReconcileIT {
     private static JdbcTemplate sourceJdbc;
     private static S3Client s3Client;
     private static ObjectStore objectStore;
-    private static RestClient migratorClient;
+    private static RestClient httpClient;
+    private static String reconcileUrl;
 
     private boolean wroteToSourceTable;
 
@@ -131,15 +133,31 @@ class ReconcileIT {
                 .build();
         objectStore = new ObjectStore(s3Client, BUCKET);
 
-        String migratorBaseUrl = System.getenv().getOrDefault("MIGRATOR_WORKER_URL", "http://localhost:8082");
+        // Defaults to the control plane's own published port and its proxy
+        // route, not to migrator-worker directly: migrator-worker is the one
+        // service `docker compose up --scale migrator-worker=N` runs more
+        // than one of, so it publishes an ephemeral host port that changes
+        // on every start and cannot be hard-coded here. The control plane's
+        // port never changes and is never scaled, and its /api/reconcile
+        // route forwards the request and hands back the worker's response
+        // body unchanged, so hitting it is equivalent to hitting the worker
+        // directly. RECONCILE_HEALTH_URL and RECONCILE_URL each override
+        // independently for anyone who wants to bypass the proxy and talk
+        // to one specific worker instance instead, at
+        // http://localhost:<port>/actuator/health and .../internal/reconcile.
+        String healthUrl = System.getenv().getOrDefault("RECONCILE_HEALTH_URL", "http://localhost:8080/health");
+        reconcileUrl = System.getenv().getOrDefault("RECONCILE_URL", "http://localhost:8080/api/reconcile");
         SimpleClientHttpRequestFactory requestFactory = new SimpleClientHttpRequestFactory();
         requestFactory.setConnectTimeout(CONNECT_TIMEOUT_MS);
         requestFactory.setReadTimeout(READ_TIMEOUT_MS);
-        migratorClient = RestClient.builder()
-                .baseUrl(migratorBaseUrl)
+        httpClient = RestClient.builder()
                 .requestFactory(requestFactory)
                 .build();
-        migratorClient.get().uri("/actuator/health").retrieve().toBodilessEntity();
+        // Deliberately not wrapped in try/catch, same reasoning as the two
+        // JDBC checks above: if the control plane (or whatever this was
+        // overridden to point at) is not reachable, fail loudly here rather
+        // than deep inside the first test's own assertions.
+        httpClient.get().uri(healthUrl).retrieve().toBodilessEntity();
     }
 
     @AfterAll
@@ -378,6 +396,12 @@ class ReconcileIT {
         long id = BASE_ID + 7;
         String error = "Source record no longer exists for a claimed id";
 
+        // Idempotent seeding: this is a plain INSERT, not an upsert, so a
+        // row an earlier aborted run left behind on this exact id (the
+        // cleanup below never ran because that run never got there) would
+        // otherwise fail this insert on a duplicate key before the test
+        // ever gets to run.
+        targetJdbc.update("DELETE FROM migration_state WHERE source_id = ?", id);
         targetJdbc.update("INSERT INTO migration_state (source_id, lane, status, source_version, "
                         + "last_error, consecutive_failures) VALUES (?, ?, ?, ?, ?, ?)",
                 id, "cdc", "FAILED_PERMANENT", 0L, error, 5);
@@ -420,11 +444,28 @@ class ReconcileIT {
      * backfill coordinator's periodic replanning, whose 30 second cycle is
      * comfortably longer than this test's own window before it restores
      * the row itself.
+     *
+     * The count assertions below compare against a baseline captured by
+     * this test immediately before it makes any change, not against each
+     * other in absolute terms: sourceCount, ledgerCount, and documentCount
+     * are unscoped totals across the whole table (see the class-level
+     * comment on reconcile() and the RESERVED_RANGE_FLOOR javadoc), so
+     * another suite's own fixture, seeded under its own reserved range and
+     * not yet cleaned up, can leave sourceCount and ledgerCount genuinely
+     * unequal before this test ever runs. Diffing against this test's own
+     * baseline is what proves the property this test actually exists to
+     * prove, that removing one document row and adding an unrelated one
+     * nets to zero change in documentCount, regardless of what documentCount
+     * happened to be before either change.
      */
     @Test
     void aSourceRowMissingItsDocumentCompensatedByAnOrphanDocumentMustNotReadAsClean() {
         long realSeededId = 17L;
         long orphanId = BASE_ID + 5;
+
+        ReconcileResult baseline = reconcile();
+        long ledgerCountBefore = baseline.ledgerCount();
+        long documentCountBefore = baseline.documentCount();
 
         Map<String, Object> originalDocument = targetJdbc.queryForMap(
                 "SELECT filename, content_type, object_key, byte_size, checksum_sha256, ocr_text, "
@@ -438,6 +479,13 @@ class ReconcileIT {
         // a bare document row with nothing else backing it is enough to
         // trigger it, and leaving ledger untouched here is what keeps
         // ledgerCount itself unaffected by this scenario.
+        //
+        // The delete before it is idempotent seeding: this is a plain
+        // INSERT, not an upsert, so a row an earlier aborted run left
+        // behind on this exact orphanId (its own finally block below never
+        // ran because that run never got there) would otherwise fail this
+        // insert on a duplicate key before the test ever gets to run.
+        targetJdbc.update("DELETE FROM document WHERE source_id = ?", orphanId);
         targetJdbc.update("INSERT INTO document (source_id, filename, content_type, object_key, byte_size, "
                         + "checksum_sha256, ocr_text, ocr_confidence, ocr_page_count, ocr_vendor_job_id) "
                         + "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -447,11 +495,13 @@ class ReconcileIT {
         try {
             ReconcileResult result = reconcile();
 
-            assertEquals(result.sourceCount(), result.ledgerCount(),
-                    "this scenario must not disturb the ledger count relative to the source count");
-            assertEquals(result.ledgerCount(), result.documentCount(),
-                    "this is exactly the compensating case: one row removed from the document table and "
-                            + "one added elsewhere, so the raw counts still agree with each other");
+            assertEquals(ledgerCountBefore, result.ledgerCount(),
+                    "this scenario never touches the ledger table, so ledgerCount must be exactly what this "
+                            + "test observed before it made any change");
+            assertEquals(documentCountBefore, result.documentCount(),
+                    "this is exactly the compensating case: one row removed from the document table and one "
+                            + "added elsewhere must net back to the documentCount this test observed before it "
+                            + "made any change");
             assertFalse(result.clean(),
                     "a source row missing its document, exactly compensated by an unrelated orphan "
                             + "document row, must never be masked by matching counts alone");
@@ -491,11 +541,21 @@ class ReconcileIT {
      *
      * Neither side of this touches the MySQL files table, so there is no
      * Debezium event, and no live consumer, to race against here.
+     *
+     * As in the document-table version above, the count assertion compares
+     * against a baseline this test captures for itself immediately before
+     * making any change, not sourceCount against ledgerCount in absolute
+     * terms: both are unscoped totals across the whole table, so another
+     * suite's own not-yet-cleaned-up fixture can leave them genuinely
+     * unequal before this test ever runs, which has nothing to do with
+     * whether this test's own compensating change nets to zero.
      */
     @Test
     void aSourceRowMissingItsLedgerRowCompensatedByAnOrphanLedgerRowMustNotReadAsClean() {
         long realSeededId = 41L;
         long orphanId = BASE_ID + 8;
+
+        long ledgerCountBefore = reconcile().ledgerCount();
 
         Map<String, Object> originalLedgerRow = targetJdbc.queryForMap(
                 "SELECT lane, status, source_version, checksum_sha256, consecutive_failures, attempts, "
@@ -504,6 +564,12 @@ class ReconcileIT {
 
         targetJdbc.update("DELETE FROM migration_state WHERE source_id = ?", realSeededId);
 
+        // Idempotent seeding: this is a plain INSERT, not an upsert, so a
+        // row an earlier aborted run left behind on this exact orphanId
+        // (its own finally block below never ran because that run never
+        // got there) would otherwise fail this insert on a duplicate key
+        // before the test ever gets to run.
+        targetJdbc.update("DELETE FROM migration_state WHERE source_id = ?", orphanId);
         targetJdbc.update("INSERT INTO migration_state (source_id, lane, status, source_version, "
                         + "checksum_sha256, consecutive_failures) VALUES (?, ?, ?, ?, ?, ?)",
                 orphanId, "backfill", "DONE", 0L, "0".repeat(64), 0);
@@ -511,9 +577,10 @@ class ReconcileIT {
         try {
             ReconcileResult result = reconcile();
 
-            assertEquals(result.sourceCount(), result.ledgerCount(),
+            assertEquals(ledgerCountBefore, result.ledgerCount(),
                     "this is exactly the compensating case: one row removed from the ledger table and one "
-                            + "added elsewhere, so the raw counts still agree with each other");
+                            + "added elsewhere must net back to the ledgerCount this test observed before it "
+                            + "made any change");
             assertFalse(result.clean(),
                     "a source row missing its ledger row, exactly compensated by an unrelated orphan "
                             + "ledger row, must never be masked by matching counts alone");
@@ -540,7 +607,7 @@ class ReconcileIT {
     }
 
     private ReconcileResult reconcile() {
-        return migratorClient.post().uri("/internal/reconcile").retrieve().body(ReconcileResult.class);
+        return httpClient.post().uri(reconcileUrl).retrieve().body(ReconcileResult.class);
     }
 
     private ReconcileResult waitUntilSeededCorpusClean(Duration timeout) {
@@ -630,11 +697,20 @@ class ReconcileIT {
      * from the same content; an outright INSERT would instead fail the
      * whole test on a duplicate key the moment the real pipeline won that
      * race, which is a timing accident, not a fixture problem.
+     *
+     * The delete right before that INSERT is a different kind of guard,
+     * against a different kind of duplicate key: idempotent seeding for a
+     * row an earlier aborted run left behind on this exact id, since
+     * nothing but this method ever writes a source row under this
+     * reserved range and a leftover row here would otherwise fail this
+     * INSERT before the test ever gets to run, indistinguishable at that
+     * point from the live-pipeline race described above.
      */
     private void insertCleanRow(long id, byte[] content) {
         wroteToSourceTable = true;
         String filename = "reconcile-" + id + ".txt";
         String contentType = "text/plain";
+        sourceJdbc.update("DELETE FROM files WHERE id = ?", id);
         sourceJdbc.update("INSERT INTO files (id, filename, content_type, content, byte_size) "
                 + "VALUES (?, ?, ?, ?, ?)", id, filename, contentType, content, content.length);
 

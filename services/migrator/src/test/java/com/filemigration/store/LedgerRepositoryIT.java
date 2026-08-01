@@ -4,6 +4,7 @@ import com.zaxxer.hikari.HikariDataSource;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.jdbc.DataSourceBuilder;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -24,9 +25,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * only "passes" when nothing was actually checked protects nothing.
  *
  * Every row this test writes uses a source id at or above the reserved
- * range below, and every one of those rows is removed after each test, so
- * running this repeatedly never leaves data behind or collides with
- * anything else in the database.
+ * range below, and every one of those rows is removed both before and
+ * after each test: every insert here is a plain INSERT on a fixed, reused
+ * source id rather than an upsert, so a row an earlier aborted or
+ * forcibly killed run left behind (its own @AfterEach never having
+ * gotten to run) would otherwise collide with this run's own insert on
+ * the same id instead of the test ever getting to run.
  */
 class LedgerRepositoryIT {
 
@@ -66,6 +70,7 @@ class LedgerRepositoryIT {
         }
     }
 
+    @BeforeEach
     @AfterEach
     void cleanUpReservedRows() {
         jdbcTemplate.update("DELETE FROM migration_state WHERE source_id >= ?", BASE_ID);
