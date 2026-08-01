@@ -74,7 +74,7 @@ is plumbed through `docker-compose.yml`.
 | `SEED_PROGRESS_LOG_INTERVAL` | `5000` | How often (in rows) the seeder logs progress. |
 | `SEED_CONNECT_RETRIES` | `30` | How many times the seeder retries its first MySQL connection, a second apart, before giving up. A passing healthcheck does not guarantee the server accepts a connection the instant it reports healthy. |
 | `VENDOR_RATE_LIMIT_RPS` | `50` | The vendor mock's combined request budget per second, and the ceiling the migrator's rate limiter enforces across both lanes. |
-| `VENDOR_BATCH_SIZE` | `25` | Files per OCR call, on both sides: the vendor mock rejects a batch larger than this, and it is the chunk size the backfill coordinator and CDC lane both use when calling it. |
+| `VENDOR_BATCH_SIZE` | `25` | Files per OCR call, on both sides: the vendor mock rejects a batch larger than this, and it is the chunk size the backfill coordinator uses when calling it. The CDC lane calls the vendor with one id per envelope and never chunks, since each envelope already represents a single row change. |
 | `VENDOR_LATENCY_MS` | `150` | Simulated per-call latency in the vendor's healthy mode; its slow mode multiplies this by 20. |
 | `VENDOR_FAILURE_MODE` | `healthy` | The vendor mock's boot-time chaos mode: `healthy`, `slow`, `rate_limited`, `erroring`, or `down`. Changeable at runtime via `POST /admin/mode` (or the dashboard's vendor mode selector) without a restart. |
 | `VENDOR_BASE_URL` | `http://vendor-mock:8088` | Where the migrator and the control plane reach the vendor mock. |
@@ -104,6 +104,7 @@ is plumbed through `docker-compose.yml`.
 | `CLAIM_RENEW_INTERVAL_SECONDS` | `10` | How often an in-progress claim is renewed, keeping the lease well short of the time an actual crash takes to detect. |
 | `CONTROL_PLANE_PORT` | `8080` | Port the control plane (API, SSE stream, dashboard) listens on. |
 | `MIGRATOR_BASE_URL` | `http://migrator-worker:8082` | Where the control plane reaches a migrator worker to proxy the reconcile action. With more than one worker replica this resolves round-robin across all of them; reconcile is stateless against the shared databases, so it doesn't matter which one answers. |
+| `MINIO_CONSOLE_URL` | `http://localhost:9001` | The MinIO console address the dashboard's trace panel links to after a file lands in Stored. Served to the browser from `GET /api/config`, so it stays correct even when the console is reachable at an address other than the default. |
 | `EVENT_POLL_INTERVAL_MS` | `500` | How often the control plane polls `migration_event` for new rows to push over SSE. |
 | `EVENT_POLL_LIMIT` | `500` | Max rows fetched per poll. |
 | `SSE_MAX_EVENTS_PER_TICK` | `200` | Max events forwarded to browsers per tick; anything past this is dropped for that tick and counted in the "dropped by the server" label rather than queued up. |
@@ -159,7 +160,7 @@ curl -X POST http://localhost:8080/api/reconcile
 
 Or click **Run reconciliation** on the dashboard. The result reports row counts across the
 source, ledger, and document tables, plus explicit lists: checksum mismatches, OCR text
-mismatches, missing or orphaned objects, missing or orphaned document rows, missing or orphaned
+mismatches, missing or unreadable objects, missing or orphaned document rows, missing or orphaned
 ledger rows, and current permanent failures. `clean: true` means every one of those lists is
 empty and all three row counts agree, which is a stronger claim than the counts merely matching:
 a deleted source row and an unrelated orphan row can make two counts agree by coincidence while

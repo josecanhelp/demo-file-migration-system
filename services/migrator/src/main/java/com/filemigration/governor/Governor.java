@@ -18,10 +18,13 @@ import java.util.function.Supplier;
  * vendor has already rejected will not succeed on a second try. A
  * RATE_LIMITED one waits out the vendor's own Retry-After instead of the
  * exponential curve, since the vendor already told us how long to wait. A
- * TRANSIENT one, or a call refused outright because the breaker is open,
- * backs off with jitter and tries again, up to the configured attempt
- * cap; once that cap is spent the last failure is handed back to the
- * caller to classify and record. Deciding whether and when to retry a
+ * TRANSIENT one backs off with jitter and tries again, up to the
+ * configured attempt cap; once that cap is spent the last failure is
+ * handed back to the caller to classify and record. A call refused
+ * outright because the breaker is open is handed back to the caller
+ * immediately as a TRANSIENT failure instead: the caller's own nack is
+ * what schedules the next attempt, so retrying here as well would just
+ * spend the wait duration twice. Deciding whether and when to retry a
  * vendor call belongs entirely here, never inside VendorClient itself.
  */
 @Component

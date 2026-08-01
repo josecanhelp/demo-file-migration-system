@@ -108,8 +108,9 @@ at which lane is actually being served. Running backfill and CDC as two Kafka to
 own consumer groups, their own rate-limiter share (`CDC_RESERVED_RATE_PCT` reserved off the top,
 backfill gets what's left, a shared permit pool caps the combined total), and their own lag
 metric makes the isolation structural: CDC's reserved share exists whether or not backfill is
-running at all, and `byLane` in the stats snapshot reports each lane's queue depth independently,
-so a starved lane shows up as a number instead of a hunch.
+running at all, and `byLane` in the stats snapshot counts only rows not yet `DONE`, grouped by
+lane, so each lane's queue depth is reported independently and a starved lane shows up on the
+dashboard as a number that holds steady or climbs instead of a hunch.
 
 ### Claim check
 

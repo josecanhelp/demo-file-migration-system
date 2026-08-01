@@ -274,6 +274,30 @@ class CdcConsumerTest {
         assertEquals(0, vendorClient.callCount());
     }
 
+    /**
+     * Same op, but this time the id already has a PENDING row sitting in
+     * the ledger, unresolved from an earlier envelope for the same id.
+     * Debezium emits op="t" for a MySQL TRUNCATE, so a row the ledger has
+     * not yet finished with is a case this consumer will actually see. The
+     * unrecognized-op branch never touches ledger state, so nothing about
+     * that PENDING row resolves as a result of this envelope; acknowledging
+     * immediately, rather than checking whether the id is resolved, is
+     * what keeps this envelope from being redelivered and nacked forever.
+     */
+    @Test
+    void unrecognizedOpIsAcknowledgedRatherThanNackLoopedWhenTheIdAlreadyHasAnUnresolvedLedgerRow() {
+        ledger.presetPending(12L);
+        RecordingAcknowledgment ack = new RecordingAcknowledgment();
+
+        consumer.consume(envelope("t", null, afterRow(12L)), ack);
+
+        assertTrue(ack.acknowledged, "an unrecognized op must be acknowledged even when the id's existing ledger "
+                + "row is still unresolved, since nack-looping it forever would never help");
+        assertNull(ack.nackedWith);
+        assertEquals(Status.PENDING, ledger.statusOf(12L), "the unrecognized op must not touch the existing row");
+        assertEquals(0, vendorClient.callCount());
+    }
+
     private void putSourceRecord(long id, String filename, String content) {
         byte[] bytes = content.getBytes(StandardCharsets.UTF_8);
         sourceRepo.put(new FileRecord(id, filename, "text/plain", bytes, bytes.length, Instant.now()));

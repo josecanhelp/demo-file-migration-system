@@ -137,8 +137,12 @@ public class CdcConsumer {
                     ledger.tombstone(id);
                     objectStore.delete(objectStore.keyFor(id));
                 }
-                default -> log.error("CDC envelope for id {} carried an unrecognized op '{}', acknowledging it "
-                        + "since retrying would never help", id, envelope.op());
+                default -> {
+                    log.error("CDC envelope for id {} carried an unrecognized op '{}', acknowledging it "
+                            + "since retrying would never help", id, envelope.op());
+                    acknowledgment.acknowledge();
+                    return;
+                }
             }
             unresolved = ledger.findUnresolved(List.of(id));
         } catch (Exception e) {

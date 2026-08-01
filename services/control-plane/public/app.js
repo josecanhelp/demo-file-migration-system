@@ -42,6 +42,7 @@
 
   let activeTrace = null;
   let vendorRequestInFlight = false;
+  let minioConsoleUrl = 'http://localhost:9001';
 
   function setPillState(pillEl, valueEl, state, text) {
     pillEl.classList.remove('state-calm', 'state-amber', 'state-red');
@@ -147,6 +148,7 @@
 
     const byStatus = stats.byStatus || {};
     const totals = stats.totals || {};
+    const byLane = stats.byLane || {};
 
     setColumnCount('source', totals.source || 0);
     setColumnCount('captured', capturedTally);
@@ -155,6 +157,9 @@
     setColumnCount('ocr', byStatus.OCR_DONE || 0);
     setColumnCount('stored', byStatus.DONE || 0);
     setColumnCount('failed', byStatus.FAILED_PERMANENT || 0);
+
+    updateQueueDepth('cdc', byLane.cdc || 0);
+    updateQueueDepth('backfill', byLane.backfill || 0);
 
     updateGauge(stats.slaLagSeconds || 0, stats.slaAlertSeconds, stats.slaTargetSeconds);
 
@@ -170,6 +175,16 @@
 
   function setColumnCount(column, value) {
     const el = document.getElementById('count-' + column);
+    if (el) {
+      el.textContent = String(value);
+    }
+  }
+
+  // Rows not yet DONE for one lane: a lane that stops making progress
+  // holds steady or climbs here, rather than the ever-growing total a
+  // plain per-lane row count would show.
+  function updateQueueDepth(lane, value) {
+    const el = document.getElementById('queue-depth-' + lane);
     if (el) {
       el.textContent = String(value);
     }
@@ -363,7 +378,7 @@
       const label = document.createElement('div');
       label.textContent = 'Object key: ' + key;
       const link = document.createElement('a');
-      link.href = 'http://localhost:9001/browser/documents';
+      link.href = minioConsoleUrl + '/browser/documents';
       link.target = '_blank';
       link.rel = 'noopener noreferrer';
       link.textContent = 'Open in MinIO console';
@@ -617,6 +632,17 @@
   async function bootstrap() {
     wireControls();
     setInterval(computeThroughput, 500);
+    try {
+      const configRes = await fetch('/api/config');
+      if (configRes.ok) {
+        const config = await configRes.json();
+        if (config.minioConsoleUrl) {
+          minioConsoleUrl = config.minioConsoleUrl;
+        }
+      }
+    } catch (err) {
+      // Falls back to the default set above.
+    }
     try {
       const res = await fetch('/api/stats');
       if (res.ok) {

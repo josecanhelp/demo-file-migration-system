@@ -25,13 +25,35 @@ async function fetchByStatus(pgPool) {
   return byStatus;
 }
 
+const LANE_QUEUE_DEPTH_QUERY = `
+  SELECT lane, COUNT(*) AS count
+    FROM migration_state
+   WHERE status <> 'DONE'
+   GROUP BY lane
+`;
+
+// Rows not yet DONE, grouped by lane: the actual queue depth. A lane that
+// stops making progress shows a number that holds steady or climbs, rather
+// than the total-ever-seen count below, which only ever goes up and cannot
+// tell a starved lane apart from a healthy one.
 async function fetchByLane(pgPool) {
-  const result = await pgPool.query('SELECT lane, COUNT(*) AS count FROM migration_state GROUP BY lane');
+  const result = await pgPool.query(LANE_QUEUE_DEPTH_QUERY);
   const byLane = {};
   for (const row of result.rows) {
     byLane[row.lane] = toFiniteNumber(row.count, 0);
   }
   return byLane;
+}
+
+// Total rows ever recorded per lane, DONE included. Useful as a lifetime
+// count, not as a health signal.
+async function fetchByLaneTotal(pgPool) {
+  const result = await pgPool.query('SELECT lane, COUNT(*) AS count FROM migration_state GROUP BY lane');
+  const byLaneTotal = {};
+  for (const row of result.rows) {
+    byLaneTotal[row.lane] = toFiniteNumber(row.count, 0);
+  }
+  return byLaneTotal;
 }
 
 async function fetchSlaLagSeconds(pgPool) {
@@ -66,9 +88,10 @@ async function fetchVendorMode(vendorBaseUrl) {
 }
 
 async function getStats({ pgPool, mysqlPool, vendorBaseUrl, slaAlertSeconds, slaTargetSeconds }) {
-  const [byStatus, byLane, slaLagSeconds, breakerState, totals, vendorMode] = await Promise.all([
+  const [byStatus, byLane, byLaneTotal, slaLagSeconds, breakerState, totals, vendorMode] = await Promise.all([
     fetchByStatus(pgPool),
     fetchByLane(pgPool),
+    fetchByLaneTotal(pgPool),
     fetchSlaLagSeconds(pgPool),
     fetchBreakerState(pgPool),
     fetchTotals(pgPool, mysqlPool),
@@ -78,6 +101,7 @@ async function getStats({ pgPool, mysqlPool, vendorBaseUrl, slaAlertSeconds, sla
   return {
     byStatus,
     byLane,
+    byLaneTotal,
     slaLagSeconds,
     slaAlertSeconds,
     slaTargetSeconds,
@@ -87,4 +111,4 @@ async function getStats({ pgPool, mysqlPool, vendorBaseUrl, slaAlertSeconds, sla
   };
 }
 
-module.exports = { getStats, fetchSlaLagSeconds, SLA_QUERY };
+module.exports = { getStats, fetchSlaLagSeconds, fetchByLane, fetchByLaneTotal, SLA_QUERY, LANE_QUEUE_DEPTH_QUERY };

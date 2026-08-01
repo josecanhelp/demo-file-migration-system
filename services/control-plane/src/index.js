@@ -33,6 +33,7 @@ const POSTGRES_DATABASE = process.env.POSTGRES_DATABASE || 'targetdb';
 
 const VENDOR_BASE_URL = process.env.VENDOR_BASE_URL || 'http://vendor-mock:8088';
 const MIGRATOR_BASE_URL = process.env.MIGRATOR_BASE_URL || 'http://migrator-worker:8082';
+const MINIO_CONSOLE_URL = process.env.MINIO_CONSOLE_URL || 'http://localhost:9001';
 
 const EVENT_POLL_INTERVAL_MS = parseInt(process.env.EVENT_POLL_INTERVAL_MS || '500', 10);
 const EVENT_POLL_LIMIT = parseInt(process.env.EVENT_POLL_LIMIT || '500', 10);
@@ -63,6 +64,13 @@ app.use(express.json());
 
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok' });
+});
+
+// Static, deployment-specific values the dashboard needs but has no other
+// way to learn, since it is served as plain static files rather than
+// templated per environment.
+app.get('/api/config', (req, res) => {
+  res.status(200).json({ minioConsoleUrl: MINIO_CONSOLE_URL });
 });
 
 app.get('/api/stats', async (req, res) => {

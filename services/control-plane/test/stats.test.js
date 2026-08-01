@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { toFiniteNumber } = require('../src/numbers');
-const { fetchSlaLagSeconds } = require('../src/stats');
+const { fetchSlaLagSeconds, fetchByLane, fetchByLaneTotal } = require('../src/stats');
 
 // The SLA query already wraps its own aggregate in COALESCE(..., 0), but a
 // row left with source_created_at NULL by the test suite is exactly the
@@ -44,4 +44,30 @@ test('fetchSlaLagSeconds returns the real lag when the driver hands back a value
     query: async () => ({ rows: [{ sla_lag_seconds: '742.5' }] }),
   };
   assert.equal(await fetchSlaLagSeconds(fakePgPool), 742.5);
+});
+
+test('fetchByLane filters out DONE work, so it reports queue depth rather than a total that only grows', async () => {
+  let capturedSql = null;
+  const fakePgPool = {
+    query: async (sql) => {
+      capturedSql = sql;
+      return { rows: [{ lane: 'cdc', count: '3' }, { lane: 'backfill', count: '0' }] };
+    },
+  };
+  const byLane = await fetchByLane(fakePgPool);
+  assert.match(capturedSql, /status\s*<>\s*'DONE'/);
+  assert.deepEqual(byLane, { cdc: 3, backfill: 0 });
+});
+
+test('fetchByLaneTotal counts every row per lane, DONE included', async () => {
+  let capturedSql = null;
+  const fakePgPool = {
+    query: async (sql) => {
+      capturedSql = sql;
+      return { rows: [{ lane: 'cdc', count: '480' }, { lane: 'backfill', count: '500' }] };
+    },
+  };
+  const byLaneTotal = await fetchByLaneTotal(fakePgPool);
+  assert.doesNotMatch(capturedSql, /WHERE/);
+  assert.deepEqual(byLaneTotal, { cdc: 480, backfill: 500 });
 });
