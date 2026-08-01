@@ -220,6 +220,33 @@ body {
   font-size: 13px;
 }
 
+.column-hint {
+  font-size: 10px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+.failed-row {
+  margin-top: 8px;
+  background: var(--red-soft);
+  border: 1px dashed var(--red);
+  border-radius: 8px;
+  padding: 8px;
+}
+
+.failed-row .column-title {
+  color: var(--red);
+}
+
+.failed-row .column-count {
+  color: var(--red);
+}
+
+.column-tray.failed-tray {
+  min-height: 28px;
+  max-height: 64px;
+}
+
 .column-tray {
   display: flex;
   flex-wrap: wrap;

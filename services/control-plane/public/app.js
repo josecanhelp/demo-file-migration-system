@@ -1,15 +1,26 @@
 'use strict';
 
 // Drives the dashboard from the control plane's HTTP API and SSE stream.
-// Column counts for Queued, Claimed, OCR and Stored come straight from the
-// stats snapshot every tick, so they never drift. The Captured column has
-// no matching status bucket (only the cdc lane emits a capture event, and
-// it is a transient point between source and claim), so it is tracked
-// live from the pipeline stream instead and reset whenever a file moves on.
+// Column counts for Queued, Claimed, OCR, Stored and the failed tray come
+// straight from the stats snapshot every tick, so they never drift. The
+// Captured column has no matching status bucket (only the cdc lane emits a
+// capture event, and it is a transient point between source and claim), so
+// it is tracked live from the pipeline stream instead, starting over at 0
+// on every page load; the interface says so next to the column.
+//
+// A row that reaches DLQ has its status set to FAILED_PERMANENT at that
+// same moment, so a DLQ event is a safe trigger for moving that row's chip
+// out of the in-flight trays and into the failed tray. The failed tray's
+// own count still comes from stats (byStatus.FAILED_PERMANENT), never from
+// counting chips or DLQ events, so it cannot say something different from
+// what the row's current status actually is. FAILED_PERMANENT is not final
+// on the cdc lane: a later real stage event for the same source id moves
+// its chip straight back into an in-flight column.
 
 (function () {
   const MAX_LIVE_CHIPS = 120;
   const CHIP_REMOVAL_DELAY_MS = 2000;
+  const FAILED_CHIP_REMOVAL_DELAY_MS = 6000;
   const FLAG_CLEAR_DELAY_MS = 2500;
   const THROUGHPUT_WINDOW_MS = 10000;
   const TRACE_POLL_INTERVAL_MS = 1000;
@@ -143,6 +154,7 @@
     setColumnCount('claimed', byStatus.IN_FLIGHT || 0);
     setColumnCount('ocr', byStatus.OCR_DONE || 0);
     setColumnCount('stored', byStatus.DONE || 0);
+    setColumnCount('failed', byStatus.FAILED_PERMANENT || 0);
 
     updateGauge(stats.slaLagSeconds || 0, stats.slaAlertSeconds, stats.slaTargetSeconds);
 
@@ -231,6 +243,32 @@
     }, CHIP_REMOVAL_DELAY_MS);
   }
 
+  // Moves a chip out of whichever in-flight tray it was sitting in and into
+  // the failed tray, so it never sits alongside chips whose rows are still
+  // actually in flight. The flag stays on (no fade) until either a later
+  // stage event clears it because the row moved forward again, or the
+  // removal timer below takes the chip out entirely.
+  function moveToFailedTray(sourceId, lane) {
+    const entry = chipRegistry.get(sourceId);
+    if (!entry) {
+      return;
+    }
+    moveChip(sourceId, lane, 'failed');
+    entry.el.classList.remove('flag-retry');
+    entry.el.classList.add('flag-dlq');
+    scheduleFailedChipRemoval(sourceId);
+  }
+
+  function scheduleFailedChipRemoval(sourceId) {
+    setTimeout(function () {
+      const entry = chipRegistry.get(sourceId);
+      if (entry && entry.column === 'failed') {
+        entry.el.remove();
+        chipRegistry.delete(sourceId);
+      }
+    }, FAILED_CHIP_REMOVAL_DELAY_MS);
+  }
+
   // --- throughput --------------------------------------------------------
 
   function recordThroughput(lane) {
@@ -278,7 +316,7 @@
     } else if (stage === 'RETRY') {
       flagChip(sourceId, 'retry');
     } else if (stage === 'DLQ') {
-      flagChip(sourceId, 'dlq');
+      moveToFailedTray(sourceId, lane);
     }
 
     if (activeTrace && activeTrace.sourceId === sourceId) {

@@ -51,6 +51,7 @@
             <span class="column-title">Captured</span>
             <span class="column-count" id="count-captured">0</span>
           </div>
+          <div class="column-hint">counted since this page opened</div>
           <div class="column-tray" id="tray-captured"></div>
         </div>
         <div class="column" data-column="queued">
@@ -81,6 +82,14 @@
           </div>
           <div class="column-tray" id="tray-stored"></div>
         </div>
+      </div>
+      <div class="failed-row" data-column="failed">
+        <div class="column-header">
+          <span class="column-title">Not currently in flight</span>
+          <span class="column-count" id="count-failed">0</span>
+        </div>
+        <div class="column-hint">FAILED_PERMANENT rows, may still be revived by a later update</div>
+        <div class="column-tray failed-tray" id="tray-failed"></div>
       </div>
       <div class="throughput-row">
         <div class="throughput-item">
