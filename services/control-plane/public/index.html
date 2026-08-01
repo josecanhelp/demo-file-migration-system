@@ -2,9 +2,156 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Migration control plane</title>
+  <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-  <p>Dashboard placeholder. The real dashboard is built in a later task.</p>
+  <header class="topbar">
+    <h1>Migration control plane</h1>
+    <div class="topbar-status">
+      <div class="pill" id="breaker-indicator" title="Circuit breaker state">
+        <span class="pill-dot"></span>
+        <span class="pill-label">breaker</span>
+        <span class="pill-value" id="breaker-value">-</span>
+      </div>
+      <div class="pill" id="vendor-indicator" title="Current vendor mode">
+        <span class="pill-dot"></span>
+        <span class="pill-label">vendor</span>
+        <span class="pill-value" id="vendor-value">-</span>
+      </div>
+      <div class="pill" id="conn-indicator" title="Live stream connection">
+        <span class="pill-dot"></span>
+        <span class="pill-label">stream</span>
+        <span class="pill-value" id="conn-value">connecting</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="panel pipeline-panel" aria-labelledby="pipeline-heading">
+      <div class="panel-header">
+        <h2 id="pipeline-heading">Pipeline</h2>
+        <div class="legend">
+          <span class="legend-item"><span class="swatch swatch-cdc"></span>cdc lane</span>
+          <span class="legend-item"><span class="swatch swatch-backfill"></span>backfill lane</span>
+          <span class="legend-item muted" id="pipeline-suppressed">0 events not drawn (rolling)</span>
+        </div>
+      </div>
+      <div class="columns" id="pipeline-columns">
+        <div class="column" data-column="source">
+          <div class="column-header">
+            <span class="column-title">Source</span>
+            <span class="column-count" id="count-source">0</span>
+          </div>
+          <div class="column-tray" id="tray-source"></div>
+        </div>
+        <div class="column" data-column="captured">
+          <div class="column-header">
+            <span class="column-title">Captured</span>
+            <span class="column-count" id="count-captured">0</span>
+          </div>
+          <div class="column-tray" id="tray-captured"></div>
+        </div>
+        <div class="column" data-column="queued">
+          <div class="column-header">
+            <span class="column-title">Queued</span>
+            <span class="column-count" id="count-queued">0</span>
+          </div>
+          <div class="column-tray" id="tray-queued"></div>
+        </div>
+        <div class="column" data-column="claimed">
+          <div class="column-header">
+            <span class="column-title">Claimed</span>
+            <span class="column-count" id="count-claimed">0</span>
+          </div>
+          <div class="column-tray" id="tray-claimed"></div>
+        </div>
+        <div class="column" data-column="ocr">
+          <div class="column-header">
+            <span class="column-title">OCR</span>
+            <span class="column-count" id="count-ocr">0</span>
+          </div>
+          <div class="column-tray" id="tray-ocr"></div>
+        </div>
+        <div class="column" data-column="stored">
+          <div class="column-header">
+            <span class="column-title">Stored</span>
+            <span class="column-count" id="count-stored">0</span>
+          </div>
+          <div class="column-tray" id="tray-stored"></div>
+        </div>
+      </div>
+      <div class="throughput-row">
+        <div class="throughput-item">
+          <span class="swatch swatch-cdc"></span>
+          <span class="throughput-label">cdc throughput</span>
+          <span class="throughput-value" id="throughput-cdc">0.0 files/s</span>
+        </div>
+        <div class="throughput-item">
+          <span class="swatch swatch-backfill"></span>
+          <span class="throughput-label">backfill throughput</span>
+          <span class="throughput-value" id="throughput-backfill">0.0 files/s</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel sla-panel" aria-labelledby="sla-heading">
+      <div class="panel-header">
+        <h2 id="sla-heading">SLA gauge</h2>
+        <span class="sla-lag-value" id="sla-lag-value">0s outstanding</span>
+      </div>
+      <div class="gauge" id="sla-gauge">
+        <div class="gauge-track">
+          <div class="gauge-fill" id="gauge-fill"></div>
+          <div class="gauge-marker" id="gauge-marker-alert"></div>
+          <div class="gauge-marker gauge-marker-breach" id="gauge-marker-breach"></div>
+        </div>
+        <div class="gauge-scale">
+          <span>0</span>
+          <span id="gauge-alert-label">alert</span>
+          <span id="gauge-breach-label">breach</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel controls-panel" aria-labelledby="controls-heading">
+      <div class="panel-header">
+        <h2 id="controls-heading">Controls</h2>
+      </div>
+      <div class="controls-grid">
+        <div class="control-group">
+          <button id="add-file-btn" class="btn btn-primary">Add a file</button>
+          <span class="control-hint" id="add-file-hint"></span>
+        </div>
+        <div class="control-group">
+          <label for="vendor-mode-select">Vendor mode</label>
+          <select id="vendor-mode-select">
+            <option value="healthy">healthy</option>
+            <option value="slow">slow</option>
+            <option value="rate_limited">rate_limited</option>
+            <option value="erroring">erroring</option>
+            <option value="down">down</option>
+          </select>
+        </div>
+        <div class="control-group">
+          <button id="reconcile-btn" class="btn">Run reconciliation</button>
+          <span class="control-hint" id="reconcile-hint"></span>
+        </div>
+      </div>
+      <div class="reconcile-result" id="reconcile-result"></div>
+    </section>
+
+    <section class="panel trace-panel" aria-labelledby="trace-heading">
+      <div class="panel-header">
+        <h2 id="trace-heading">Trace</h2>
+        <span class="control-hint" id="trace-subheading">no file traced yet</span>
+      </div>
+      <ol class="trace-list" id="trace-list"></ol>
+      <div class="trace-object" id="trace-object"></div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
 </body>
 </html>
