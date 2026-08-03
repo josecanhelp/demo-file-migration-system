@@ -3,10 +3,12 @@ package com.filemigration.worker;
 import com.filemigration.model.FileRecord;
 import com.filemigration.store.SourceFileRepository;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * In-memory stand-in for SourceFileRepository. Records are looked up by
@@ -35,5 +37,11 @@ class FakeSourceFileRepository extends SourceFileRepository {
             }
         }
         return found;
+    }
+
+    @Override
+    public Optional<Instant> findCreatedAtById(long id) {
+        FileRecord record = records.get(id);
+        return record == null ? Optional.empty() : Optional.ofNullable(record.createdAt());
     }
 }

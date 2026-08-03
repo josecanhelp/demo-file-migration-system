@@ -15,6 +15,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -221,6 +222,60 @@ class LedgerRepositoryIT {
                 "SELECT status, lane FROM migration_state WHERE source_id = ?", id);
         assertEquals("IN_FLIGHT", row.get("status"));
         assertEquals("cdc", row.get("lane"));
+    }
+
+    @Test
+    void seedPendingPersistsAndRoundTripsSourceCreatedAt() {
+        long id = BASE_ID + 21;
+        Instant createdAt = Instant.now().minusSeconds(3600).truncatedTo(java.time.temporal.ChronoUnit.MILLIS);
+
+        int inserted = ledger.seedPending(List.of(id), "cdc", Map.of(id, createdAt));
+
+        assertEquals(1, inserted);
+        Timestamp stored = jdbcTemplate.queryForObject(
+                "SELECT source_created_at FROM migration_state WHERE source_id = ?", Timestamp.class, id);
+        assertEquals(createdAt, stored.toInstant(), "source_created_at must round-trip to exactly the instant "
+                + "passed in, not merely to some non-null value");
+    }
+
+    @Test
+    void seedPendingLeavesSourceCreatedAtNullWhenTheMapHasNoEntryForTheId() {
+        long id = BASE_ID + 22;
+
+        ledger.seedPending(List.of(id), "cdc", Map.of());
+
+        Timestamp stored = jdbcTemplate.queryForObject(
+                "SELECT source_created_at FROM migration_state WHERE source_id = ?", Timestamp.class, id);
+        assertNull(stored, "an id absent from the createdAt map must leave source_created_at NULL rather than "
+                + "failing or defaulting to something else");
+    }
+
+    /**
+     * The freshness gauge in the control plane reads
+     * COALESCE(EXTRACT(EPOCH FROM (now() - MIN(source_created_at))), 0)
+     * over outstanding rows on a lane. MIN() already ignores NULLs on its
+     * own, but this proves it directly against the real aggregate: a
+     * lane with one row of unknown age (NULL, as every row was before
+     * this fix) sitting alongside one row that is genuinely, measurably
+     * behind must still report that row's real lag, not let the NULL
+     * pull the whole aggregate down to nothing.
+     */
+    @Test
+    void freshnessAggregateIgnoresANullRowButStillReflectsAGenuinelyOutstandingOne() {
+        long unknownAge = BASE_ID + 23;
+        long genuinelyOld = BASE_ID + 24;
+        Instant oldCreatedAt = Instant.now().minusSeconds(7200);
+        ledger.seedPending(List.of(unknownAge), "cdc", Map.of());
+        ledger.seedPending(List.of(genuinelyOld), "cdc", Map.of(genuinelyOld, oldCreatedAt));
+
+        Double lagSeconds = jdbcTemplate.queryForObject(
+                "SELECT COALESCE(EXTRACT(EPOCH FROM (now() - MIN(source_created_at))), 0) "
+                        + "FROM migration_state WHERE lane = 'cdc' AND status <> 'DONE' AND source_id >= ?",
+                Double.class, BASE_ID + 23);
+
+        assertTrue(lagSeconds != null && lagSeconds > 7000,
+                "a NULL row must never pull a mixed aggregate down to 0 when a genuinely outstanding row is "
+                        + "present; MIN() ignoring the NULL is what a NULL-tolerant reading of this column relies on");
     }
 
     @Test

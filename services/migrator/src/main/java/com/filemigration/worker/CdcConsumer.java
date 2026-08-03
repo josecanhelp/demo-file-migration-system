@@ -9,6 +9,7 @@ import com.filemigration.model.Stage;
 import com.filemigration.store.EventRepository;
 import com.filemigration.store.LedgerRepository;
 import com.filemigration.store.ObjectStore;
+import com.filemigration.store.SourceFileRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -18,7 +19,9 @@ import org.springframework.kafka.support.Acknowledgment;
 import org.springframework.stereotype.Component;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Consumes Debezium change envelopes for sourcedb.files and drives each one
@@ -65,16 +68,18 @@ public class CdcConsumer {
     private final LedgerRepository ledger;
     private final ObjectStore objectStore;
     private final EventRepository eventRepo;
+    private final SourceFileRepository sourceRepo;
     private final ObjectMapper objectMapper;
     private final Duration nackBackoff;
 
     public CdcConsumer(MigrationService migrationService, LedgerRepository ledger, ObjectStore objectStore,
-            EventRepository eventRepo, ObjectMapper objectMapper,
+            EventRepository eventRepo, SourceFileRepository sourceRepo, ObjectMapper objectMapper,
             @Value("${migrator.cdc.nack-backoff-seconds}") long nackBackoffSeconds) {
         this.migrationService = migrationService;
         this.ledger = ledger;
         this.objectStore = objectStore;
         this.eventRepo = eventRepo;
+        this.sourceRepo = sourceRepo;
         this.objectMapper = objectMapper;
         this.nackBackoff = Duration.ofSeconds(nackBackoffSeconds);
     }
@@ -118,7 +123,7 @@ public class CdcConsumer {
         try {
             switch (envelope.op()) {
                 case OP_CREATE, OP_READ -> {
-                    ledger.seedPending(List.of(id), LANE, null);
+                    ledger.seedPending(List.of(id), LANE, sourceCreatedAtMap(id, envelope));
                     migrationService.migrate(List.of(id), LANE);
                 }
                 case OP_UPDATE -> {
@@ -129,7 +134,7 @@ public class CdcConsumer {
                     // PENDING row a create would give it, rather than
                     // resetForUpdate matching zero rows and this envelope
                     // being acknowledged with nothing done.
-                    ledger.seedPending(List.of(id), LANE, null);
+                    ledger.seedPending(List.of(id), LANE, sourceCreatedAtMap(id, envelope));
                     ledger.resetForUpdate(id, envelope.version());
                     migrationService.migrate(List.of(id), LANE);
                 }
@@ -170,6 +175,24 @@ public class CdcConsumer {
     }
 
     /**
+     * The map seedPending expects for one id: the envelope's own
+     * created_at when it carried one, since that avoids a round trip to
+     * MySQL, or the value read straight from the source row when it did
+     * not. Delete envelopes never reach this, since they tombstone rather
+     * than seed. A map with no entry for id, rather than a map containing
+     * a null value, is what tells seedPending to leave source_created_at
+     * NULL; that only happens if the source row itself is already gone by
+     * the time the fallback runs.
+     */
+    private Map<Long, Instant> sourceCreatedAtMap(long id, CdcEnvelope envelope) {
+        Instant createdAt = envelope.sourceCreatedAt();
+        if (createdAt == null) {
+            createdAt = sourceRepo.findCreatedAtById(id).orElse(null);
+        }
+        return createdAt == null ? Map.of() : Map.of(id, createdAt);
+    }
+
+    /**
      * The Debezium change envelope for one row. Only the fields this
      * consumer actually acts on are modeled; everything else Debezium
      * includes (source metadata, transaction info, and so on) is ignored.
@@ -189,6 +212,22 @@ public class CdcConsumer {
                 return null;
             }
             return row.get("id").asLong();
+        }
+
+        /**
+         * The row's created_at, read from "after" the same way sourceId()
+         * reads "id". Debezium's MySQL connector renders a DATETIME(3)
+         * column, which is what files.created_at is, as milliseconds since
+         * the epoch rather than as text, so this converts accordingly
+         * rather than parsing a string. Absent whenever the field is
+         * missing or null, which callers treat as a signal to fall back to
+         * reading it from the source row directly.
+         */
+        Instant sourceCreatedAt() {
+            if (after == null || !after.hasNonNull("created_at")) {
+                return null;
+            }
+            return Instant.ofEpochMilli(after.get("created_at").asLong());
         }
 
         /**

@@ -49,8 +49,18 @@ public class DataSourceConfig {
         HikariDataSource dataSource = DataSourceBuilder.create()
                 .type(HikariDataSource.class)
                 .driverClassName("com.mysql.cj.jdbc.Driver")
+                // connectionTimeZone=UTC is what stops the driver from
+                // reading files.created_at (a plain DATETIME, which MySQL
+                // stores with no timezone of its own) back through
+                // whichever timezone this JVM happens to default to.
+                // Every other clock in this stack, MySQL's own SYSTEM
+                // time_zone, Debezium's rendering of the same column, and
+                // Postgres's TIMESTAMPTZ columns, is UTC; without this,
+                // source_created_at would be silently wrong by a fixed
+                // offset on any host whose default timezone is not UTC.
                 .url("jdbc:mysql://" + host + ":" + port + "/" + database
-                        + "?useSSL=false&allowPublicKeyRetrieval=true&connectionCollation=utf8mb4_general_ci")
+                        + "?useSSL=false&allowPublicKeyRetrieval=true&connectionCollation=utf8mb4_general_ci"
+                        + "&connectionTimeZone=UTC")
                 .username(username)
                 .password(password)
                 .build();

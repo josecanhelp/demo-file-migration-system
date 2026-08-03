@@ -55,7 +55,7 @@ class CdcConsumerTest {
         migrationService = new MigrationService(ledger, sourceRepo, objectStore,
                 new FakeDocumentRepository(), eventRepo, vendorClient, TestGovernorFactory.passthrough(),
                 OBJECT_MAPPER, CLAIM_RENEW_INTERVAL_SECONDS, WORKER_CONCURRENCY, MAX_RETRY_ATTEMPTS);
-        consumer = new CdcConsumer(migrationService, ledger, objectStore, eventRepo, OBJECT_MAPPER,
+        consumer = new CdcConsumer(migrationService, ledger, objectStore, eventRepo, sourceRepo, OBJECT_MAPPER,
                 NACK_BACKOFF_SECONDS);
     }
 
@@ -76,6 +76,36 @@ class CdcConsumerTest {
         assertEquals(Status.DONE, ledger.statusOf(1L));
         assertEquals(1, eventRepo.countByStageAndId(Stage.CDC_CAPTURED, 1L),
                 "a CDC_CAPTURED event must be recorded on receipt");
+    }
+
+    @Test
+    void createEnvelopeSeedsLedgerRowWithTheCreatedAtCarriedInTheEnvelope() {
+        Instant envelopeCreatedAt = Instant.parse("2026-01-01T00:00:00Z");
+        Instant sourceRowCreatedAt = Instant.parse("2020-01-01T00:00:00Z");
+        sourceRepo.put(new FileRecord(20L, "invoice-20.txt", "text/plain",
+                "content".getBytes(StandardCharsets.UTF_8), 7, sourceRowCreatedAt));
+        RecordingAcknowledgment ack = new RecordingAcknowledgment();
+
+        consumer.consume(envelope("c", null, afterRowWithCreatedAt(20L, envelopeCreatedAt)), ack);
+
+        assertTrue(ack.acknowledged);
+        assertEquals(envelopeCreatedAt, ledger.sourceCreatedAtOf(20L),
+                "the envelope's own created_at must be used, not the source row's, when the envelope carries one");
+    }
+
+    @Test
+    void createEnvelopeWithNoCreatedAtFallsBackToReadingItFromTheSourceRow() {
+        Instant sourceRowCreatedAt = Instant.parse("2020-01-01T00:00:00Z");
+        sourceRepo.put(new FileRecord(21L, "invoice-21.txt", "text/plain",
+                "content".getBytes(StandardCharsets.UTF_8), 7, sourceRowCreatedAt));
+        RecordingAcknowledgment ack = new RecordingAcknowledgment();
+
+        // afterRow() carries no created_at field at all.
+        consumer.consume(envelope("c", null, afterRow(21L)), ack);
+
+        assertTrue(ack.acknowledged);
+        assertEquals(sourceRowCreatedAt, ledger.sourceCreatedAtOf(21L),
+                "an envelope missing created_at must fall back to reading it from the source row");
     }
 
     @Test
@@ -306,6 +336,13 @@ class CdcConsumerTest {
     private static String afterRow(long id) {
         return "{\"id\":" + id + ",\"filename\":\"invoice-" + id + ".txt\",\"content_type\":\"text/plain\","
                 + "\"byte_size\":10}";
+    }
+
+    // Debezium renders a DATETIME(3) column as milliseconds since the
+    // epoch, not as text, which is what this mirrors.
+    private static String afterRowWithCreatedAt(long id, Instant createdAt) {
+        return "{\"id\":" + id + ",\"filename\":\"invoice-" + id + ".txt\",\"content_type\":\"text/plain\","
+                + "\"byte_size\":10,\"created_at\":" + createdAt.toEpochMilli() + "}";
     }
 
     private static String beforeRow(long id) {

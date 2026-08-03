@@ -45,6 +45,7 @@ import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
+import java.sql.Timestamp;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -58,6 +59,7 @@ import java.util.function.BooleanSupplier;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -159,7 +161,7 @@ class CdcIT {
         targetJdbc.queryForObject("SELECT 1", Integer.class);
 
         String sourceUrl = System.getenv().getOrDefault("SOURCE_JDBC_URL",
-                "jdbc:mysql://localhost:3306/sourcedb?useSSL=false&allowPublicKeyRetrieval=true");
+                "jdbc:mysql://localhost:3306/sourcedb?useSSL=false&allowPublicKeyRetrieval=true&connectionTimeZone=UTC");
         String sourceUser = System.getenv().getOrDefault("SOURCE_JDBC_USERNAME", "root");
         String sourcePassword = System.getenv().getOrDefault("SOURCE_JDBC_PASSWORD", "root");
         sourceDataSource = DataSourceBuilder.create()
@@ -205,7 +207,7 @@ class CdcIT {
         migrationService = new MigrationService(ledger, sourceRepo, objectStore, documentRepo, eventRepo,
                 vendorClient, TestGovernorFactory.passthrough(), OBJECT_MAPPER, CLAIM_RENEW_INTERVAL_SECONDS,
                 WORKER_CONCURRENCY, MAX_RETRY_ATTEMPTS);
-        consumer = new CdcConsumer(migrationService, ledger, objectStore, eventRepo, OBJECT_MAPPER,
+        consumer = new CdcConsumer(migrationService, ledger, objectStore, eventRepo, sourceRepo, OBJECT_MAPPER,
                 NACK_BACKOFF_SECONDS);
 
         // Read from the same application.yml key the real @KafkaListener
@@ -296,6 +298,80 @@ class CdcIT {
         // that put the blob column back on the wire.
         JsonNode after = OBJECT_MAPPER.readTree(lastPayloadById.get(id)).get("after");
         assertFalse(after.has("content"), "the CDC envelope must never carry the blob column");
+    }
+
+    @Test
+    void createEnvelopeCarriesTheSourceRowsCreatedAtIntoTheLedger() throws Exception {
+        byte[] content = ("CDCIT CREATEDAT " + UUID.randomUUID()).getBytes(StandardCharsets.UTF_8);
+        long id = insertFile("cdcit-createdat-" + UUID.randomUUID(), "text/plain", content);
+
+        driveConsumptionUntil(() -> isDone(id), DETECTION_TIMEOUT,
+                "source_id " + id + " did not reach status DONE");
+
+        Timestamp sourceCreatedAt = sourceJdbc.queryForObject(
+                "SELECT created_at FROM files WHERE id = ?", Timestamp.class, id);
+        Timestamp ledgerCreatedAt = targetJdbc.queryForObject(
+                "SELECT source_created_at FROM migration_state WHERE source_id = ?", Timestamp.class, id);
+        assertNotNull(ledgerCreatedAt, "the CDC lane must populate source_created_at rather than leave it NULL");
+        assertEquals(sourceCreatedAt.toInstant(), ledgerCreatedAt.toInstant(),
+                "migration_state.source_created_at must match the MySQL row's own created_at exactly");
+    }
+
+    /**
+     * The freshness gauge (see stats.js's SLA_QUERY in the control plane)
+     * reads COALESCE(EXTRACT(EPOCH FROM (now() - MIN(source_created_at))),
+     * 0) over outstanding cdc rows. With source_created_at always NULL,
+     * that COALESCE silently substitutes 0 no matter how far behind a
+     * file actually is. Vendor mode is set to "down" so this row's own
+     * migration attempt keeps failing and it never reaches DONE, keeping
+     * it in the gauge's scope for the query below to actually measure.
+     *
+     * Driven by calling this test's own CdcConsumer instance directly on
+     * a hand-built envelope rather than through the real topic: that
+     * consumer's raw Kafka reader always starts from the earliest offset
+     * under a brand new group, so with the vendor down it would also
+     * replay, and slowly retry, every other still-unresolved envelope
+     * already sitting on the shared topic from other suites, turning
+     * this test's timeout into a fight against unrelated backlog instead
+     * of a check of the one thing it cares about. This still exercises
+     * the real seedPending/CdcConsumer production code against the same
+     * real Postgres instance the freshness gauge itself reads, only
+     * without going through the topic to reach it.
+     */
+    @Test
+    void anOutstandingRowWithAPopulatedSourceCreatedAtProducesANonZeroFreshnessLag() throws Exception {
+        setVendorMode("down");
+        try {
+            byte[] content = ("CDCIT FRESHNESS " + UUID.randomUUID()).getBytes(StandardCharsets.UTF_8);
+            long id = insertFile("cdcit-freshness-" + UUID.randomUUID(), "text/plain", content);
+
+            // No created_at in "after": this also proves the fallback to
+            // reading it from the source row works end to end, against
+            // the real MySQL connection, not only against a fake one.
+            String payload = "{\"op\":\"c\",\"before\":null,\"after\":{\"id\":" + id + "},\"ts_ms\":"
+                    + System.currentTimeMillis() + "}";
+            consumer.consume(payload, new RecordingAcknowledgment());
+
+            assertTrue(hasSourceCreatedAt(id), "the CDC lane must seed source_created_at even when the vendor "
+                    + "is unreachable, since seeding happens before the vendor is ever called");
+            assertFalse(isDone(id), "vendor mode 'down' must keep this row from ever reaching DONE, or it falls "
+                    + "out of the freshness gauge's scope and this assertion means nothing");
+
+            // Real, if small, elapsed time since the row was seeded, so the
+            // lag below is not just an artifact of clock skew between this
+            // process and Postgres.
+            Thread.sleep(1500);
+
+            Double lagSeconds = targetJdbc.queryForObject(
+                    "SELECT COALESCE(EXTRACT(EPOCH FROM (now() - MIN(source_created_at))), 0) "
+                            + "FROM migration_state WHERE lane = 'cdc' AND status <> 'DONE' AND source_id = ?",
+                    Double.class, id);
+            assertTrue(lagSeconds != null && lagSeconds > 0,
+                    "an outstanding cdc row with a populated source_created_at must report a non-zero freshness "
+                            + "lag, not the 0 COALESCE silently substitutes for an all-NULL aggregate");
+        } finally {
+            setVendorMode("healthy");
+        }
     }
 
     @Test
@@ -443,6 +519,12 @@ class CdcIT {
         List<Map<String, Object>> rows = targetJdbc.queryForList(
                 "SELECT status FROM migration_state WHERE source_id = ?", id);
         return !rows.isEmpty() && "DONE".equals(rows.get(0).get("status"));
+    }
+
+    private boolean hasSourceCreatedAt(long id) {
+        List<Map<String, Object>> rows = targetJdbc.queryForList(
+                "SELECT source_created_at FROM migration_state WHERE source_id = ?", id);
+        return !rows.isEmpty() && rows.get(0).get("source_created_at") != null;
     }
 
     private boolean isGoneFromLedgerAndDocument(long id) {

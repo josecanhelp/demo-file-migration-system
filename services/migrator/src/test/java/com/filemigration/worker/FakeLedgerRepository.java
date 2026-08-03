@@ -61,6 +61,11 @@ class FakeLedgerRepository extends LedgerRepository {
         return row == null ? null : row.status;
     }
 
+    Instant sourceCreatedAtOf(long id) {
+        Row row = rows.get(id);
+        return row == null ? null : row.sourceCreatedAt;
+    }
+
     String lastErrorOf(long id) {
         Row row = rows.get(id);
         return row == null ? null : row.lastError;
@@ -75,7 +80,9 @@ class FakeLedgerRepository extends LedgerRepository {
         int inserted = 0;
         for (Long id : ids) {
             if (!rows.containsKey(id)) {
-                rows.put(id, new Row(Status.PENDING, null));
+                Row row = new Row(Status.PENDING, null);
+                row.sourceCreatedAt = createdAt == null ? null : createdAt.get(id);
+                rows.put(id, row);
                 inserted++;
             }
         }
@@ -209,6 +216,7 @@ class FakeLedgerRepository extends LedgerRepository {
         private int attempts;
         private int consecutiveFailures;
         private long sourceVersion;
+        private Instant sourceCreatedAt;
 
         private Row(Status status, String ocrPayload) {
             this.status = status;

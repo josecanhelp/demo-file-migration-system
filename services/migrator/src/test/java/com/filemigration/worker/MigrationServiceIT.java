@@ -91,7 +91,7 @@ class MigrationServiceIT {
         targetJdbc.queryForObject("SELECT 1", Integer.class);
 
         String sourceUrl = System.getenv().getOrDefault("SOURCE_JDBC_URL",
-                "jdbc:mysql://localhost:3306/sourcedb?useSSL=false&allowPublicKeyRetrieval=true");
+                "jdbc:mysql://localhost:3306/sourcedb?useSSL=false&allowPublicKeyRetrieval=true&connectionTimeZone=UTC");
         String sourceUser = System.getenv().getOrDefault("SOURCE_JDBC_USERNAME", "root");
         String sourcePassword = System.getenv().getOrDefault("SOURCE_JDBC_PASSWORD", "root");
         sourceDataSource = DataSourceBuilder.create()

@@ -47,6 +47,7 @@ import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.sql.Timestamp;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.HashSet;
@@ -135,7 +136,7 @@ class BackfillIT {
         targetJdbc.queryForObject("SELECT 1", Integer.class);
 
         String sourceUrl = System.getenv().getOrDefault("SOURCE_JDBC_URL",
-                "jdbc:mysql://localhost:3306/sourcedb?useSSL=false&allowPublicKeyRetrieval=true");
+                "jdbc:mysql://localhost:3306/sourcedb?useSSL=false&allowPublicKeyRetrieval=true&connectionTimeZone=UTC");
         String sourceUser = System.getenv().getOrDefault("SOURCE_JDBC_USERNAME", "root");
         String sourcePassword = System.getenv().getOrDefault("SOURCE_JDBC_PASSWORD", "root");
         sourceDataSource = DataSourceBuilder.create()
@@ -269,8 +270,14 @@ class BackfillIT {
 
         for (Long id : ids) {
             Map<String, Object> state = targetJdbc.queryForMap(
-                    "SELECT status FROM migration_state WHERE source_id = ?", id);
+                    "SELECT status, source_created_at FROM migration_state WHERE source_id = ?", id);
             assertEquals("DONE", state.get("status"), "id " + id + " must reach DONE");
+
+            Timestamp sourceCreatedAt = sourceJdbc.queryForObject(
+                    "SELECT created_at FROM files WHERE id = ?", Timestamp.class, id);
+            assertEquals(sourceCreatedAt.toInstant(), ((Timestamp) state.get("source_created_at")).toInstant(),
+                    "migration_state.source_created_at for id " + id + " must match the source row's created_at, "
+                            + "not be left NULL");
 
             byte[] stored = s3Client.getObject(GetObjectRequest.builder()
                     .bucket(BUCKET)

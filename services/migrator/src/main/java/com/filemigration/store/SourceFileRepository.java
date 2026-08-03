@@ -10,6 +10,7 @@ import java.sql.Timestamp;
 import java.time.Instant;
 import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
 
 /**
  * Reads file blobs and identifiers from the MySQL source database. This is
@@ -49,12 +50,37 @@ public class SourceFileRepository {
     }
 
     /**
-     * Lists ids in an inclusive range, ascending. Used by the backfill
-     * coordinator to slice the source table into claimable ranges.
+     * Ids and their created_at in an inclusive range, ascending, without
+     * fetching the blob. Used by the backfill coordinator to slice the
+     * source table into claimable ranges and to seed each ledger row with
+     * the age of the file it tracks, which is what lets the freshness
+     * gauge measure real lag on the backfill lane instead of always
+     * reading zero.
      */
-    public List<Long> findIdsInRange(long start, long end) {
-        String sql = "SELECT id FROM files WHERE id >= ? AND id <= ? ORDER BY id";
-        return sourceJdbc.query(sql, (rs, rowNum) -> rs.getLong("id"), start, end);
+    public List<IdCreatedAt> findIdsWithCreatedAtInRange(long start, long end) {
+        String sql = "SELECT id, created_at FROM files WHERE id >= ? AND id <= ? ORDER BY id";
+        return sourceJdbc.query(sql,
+                (rs, rowNum) -> new IdCreatedAt(rs.getLong("id"), toInstant(rs.getTimestamp("created_at"))),
+                start, end);
+    }
+
+    /**
+     * The created_at of one source row, or empty if the id no longer
+     * exists. Used as a fallback when a CDC envelope's own payload does
+     * not carry created_at, so the ledger still gets a value at the cost
+     * of one extra round trip rather than being left NULL.
+     */
+    public Optional<Instant> findCreatedAtById(long id) {
+        List<Instant> found = sourceJdbc.query(
+                "SELECT created_at FROM files WHERE id = ?",
+                (rs, rowNum) -> toInstant(rs.getTimestamp("created_at")), id);
+        return found.isEmpty() ? Optional.empty() : Optional.ofNullable(found.get(0));
+    }
+
+    /**
+     * One source id paired with its created_at.
+     */
+    public record IdCreatedAt(long id, Instant createdAt) {
     }
 
     /**

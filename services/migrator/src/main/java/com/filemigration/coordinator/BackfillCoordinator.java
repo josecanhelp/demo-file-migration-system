@@ -19,6 +19,9 @@ import org.springframework.context.event.EventListener;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Component;
 
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -153,14 +156,21 @@ public class BackfillCoordinator {
     // mark done) without going through the claim loop, which is exercised
     // separately against a reserved range of its own.
     void processRange(BackfillRange range) {
-        List<Long> ids = sourceRepo.findIdsInRange(range.rangeStart(), range.rangeEnd());
+        List<SourceFileRepository.IdCreatedAt> rows =
+                sourceRepo.findIdsWithCreatedAtInRange(range.rangeStart(), range.rangeEnd());
+        List<Long> ids = new ArrayList<>(rows.size());
+        Map<Long, Instant> createdAtById = new HashMap<>();
+        for (SourceFileRepository.IdCreatedAt row : rows) {
+            ids.add(row.id());
+            createdAtById.put(row.id(), row.createdAt());
+        }
         List<List<Long>> chunks = Chunker.chunk(ids, vendorBatchSize);
         int published = 0;
         for (List<Long> chunk : chunks) {
             // Seeding must commit before the matching chunk is published:
             // otherwise a consumer could pull the message and try to
             // claim ids the ledger does not know about yet.
-            ledger.seedPending(chunk, LANE, null);
+            ledger.seedPending(chunk, LANE, createdAtById);
             publish(chunk);
             published += chunk.size();
         }
