@@ -29,120 +29,19 @@
   </header>
 
   <main class="layout">
-    <section class="panel pipeline-panel" aria-labelledby="pipeline-heading">
-      <div class="panel-header">
-        <h2 id="pipeline-heading">Pipeline</h2>
-        <div class="legend">
-          <span class="legend-item"><span class="swatch swatch-cdc"></span>cdc lane</span>
-          <span class="legend-item"><span class="swatch swatch-backfill"></span>backfill lane</span>
-          <span class="legend-item muted" id="pipeline-suppressed">0 events not drawn (rolling)</span>
-        </div>
-      </div>
-      <div class="columns" id="pipeline-columns">
-        <div class="column" data-column="source">
-          <div class="column-header">
-            <span class="column-title">Source</span>
-            <span class="column-count" id="count-source">0</span>
-          </div>
-          <div class="column-tray" id="tray-source"></div>
-        </div>
-        <div class="column" data-column="captured">
-          <div class="column-header">
-            <span class="column-title">Captured</span>
-            <span class="column-count" id="count-captured">0</span>
-          </div>
-          <div class="column-hint">counted since this page opened</div>
-          <div class="column-tray" id="tray-captured"></div>
-        </div>
-        <div class="column" data-column="queued">
-          <div class="column-header">
-            <span class="column-title">Queued</span>
-            <span class="column-count" id="count-queued">0</span>
-          </div>
-          <div class="column-tray" id="tray-queued"></div>
-        </div>
-        <div class="column" data-column="claimed">
-          <div class="column-header">
-            <span class="column-title">Claimed</span>
-            <span class="column-count" id="count-claimed">0</span>
-          </div>
-          <div class="column-tray" id="tray-claimed"></div>
-        </div>
-        <div class="column" data-column="ocr">
-          <div class="column-header">
-            <span class="column-title">OCR</span>
-            <span class="column-count" id="count-ocr">0</span>
-          </div>
-          <div class="column-tray" id="tray-ocr"></div>
-        </div>
-        <div class="column" data-column="stored">
-          <div class="column-header">
-            <span class="column-title">Stored</span>
-            <span class="column-count" id="count-stored">0</span>
-          </div>
-          <div class="column-tray" id="tray-stored"></div>
-        </div>
-      </div>
-      <div class="failed-row" data-column="failed">
-        <div class="column-header">
-          <span class="column-title">Not currently in flight</span>
-          <span class="column-count" id="count-failed">0</span>
-        </div>
-        <div class="column-hint">FAILED_PERMANENT rows, may still be revived by a later update</div>
-        <div class="column-tray failed-tray" id="tray-failed"></div>
-      </div>
-      <div class="throughput-row">
-        <div class="throughput-item">
-          <span class="swatch swatch-cdc"></span>
-          <span class="throughput-label">cdc throughput</span>
-          <span class="throughput-value" id="throughput-cdc">0.0 files/s</span>
-        </div>
-        <div class="throughput-item">
-          <span class="swatch swatch-backfill"></span>
-          <span class="throughput-label">backfill throughput</span>
-          <span class="throughput-value" id="throughput-backfill">0.0 files/s</span>
-        </div>
-      </div>
-      <div class="throughput-row">
-        <div class="throughput-item">
-          <span class="swatch swatch-cdc"></span>
-          <span class="throughput-label">cdc queue depth</span>
-          <span class="throughput-value" id="queue-depth-cdc">0</span>
-        </div>
-        <div class="throughput-item">
-          <span class="swatch swatch-backfill"></span>
-          <span class="throughput-label">backfill queue depth</span>
-          <span class="throughput-value" id="queue-depth-backfill">0</span>
-        </div>
-      </div>
-    </section>
-
-    <section class="panel sla-panel" aria-labelledby="sla-heading">
-      <div class="panel-header">
-        <h2 id="sla-heading">SLA gauge</h2>
-        <span class="sla-lag-value" id="sla-lag-value">0s outstanding</span>
-      </div>
-      <div class="gauge" id="sla-gauge">
-        <div class="gauge-track">
-          <div class="gauge-fill" id="gauge-fill"></div>
-          <div class="gauge-marker" id="gauge-marker-alert"></div>
-          <div class="gauge-marker gauge-marker-breach" id="gauge-marker-breach"></div>
-        </div>
-        <div class="gauge-scale">
-          <span>0</span>
-          <span id="gauge-alert-label">alert</span>
-          <span id="gauge-breach-label">breach</span>
-        </div>
-      </div>
-    </section>
-
     <section class="panel controls-panel" aria-labelledby="controls-heading">
       <div class="panel-header">
         <h2 id="controls-heading">Controls</h2>
       </div>
       <div class="controls-grid">
-        <div class="control-group">
-          <button id="add-file-btn" class="btn btn-primary">Add a file</button>
+        <div class="control-group add-file-group">
+          <span class="control-group-label">Add files</span>
+          <div class="add-file-buttons">
+            <button type="button" class="btn btn-primary" data-add-count="1">Add 1 file</button>
+            <button type="button" class="btn btn-primary" data-add-count="10">Add 10 files</button>
+            <button type="button" class="btn btn-primary" data-add-count="100">Add 100 files</button>
+            <button type="button" class="btn btn-primary" data-add-count="1000">Add 1,000 files</button>
+          </div>
           <span class="control-hint" id="add-file-hint"></span>
         </div>
         <div class="control-group">
@@ -163,13 +62,132 @@
       <div class="reconcile-result" id="reconcile-result"></div>
     </section>
 
-    <section class="panel trace-panel" aria-labelledby="trace-heading">
+    <section class="panel pipeline-panel" aria-labelledby="pipeline-heading">
       <div class="panel-header">
-        <h2 id="trace-heading">Trace</h2>
-        <span class="control-hint" id="trace-subheading">no file traced yet</span>
+        <h2 id="pipeline-heading">Pipeline</h2>
+        <div class="legend">
+          <span class="legend-item"><span class="swatch swatch-cdc"></span>live lane (change data capture, CDC)</span>
+          <span class="legend-item"><span class="swatch swatch-backfill"></span>backfill lane (catch-up pass)</span>
+          <span class="legend-item muted" id="pipeline-suppressed">0 events not drawn (rolling)</span>
+        </div>
       </div>
-      <ol class="trace-list" id="trace-list"></ol>
-      <div class="trace-object" id="trace-object"></div>
+      <p class="pacing-note">
+        Chip movement is paced so each step is visible. Real timings are shown on each stored file below,
+        in Recently stored.
+      </p>
+      <div class="columns-scroll">
+        <div class="columns" id="pipeline-columns">
+          <div class="column" data-column="source">
+            <div class="column-header">
+              <span class="column-title">Original files <span class="column-title-secondary">(source)</span></span>
+              <span class="column-count" id="count-source">0</span>
+            </div>
+            <p class="column-explain">Files still sitting in the old database, waiting to be picked up by the migration.</p>
+            <div class="column-tray" id="tray-source"></div>
+          </div>
+          <div class="column" data-column="captured">
+            <div class="column-header">
+              <span class="column-title">Picked up <span class="column-title-secondary">(captured)</span></span>
+              <span class="column-count" id="count-captured">0</span>
+            </div>
+            <p class="column-explain">Noticed by the live lane, which watches the database's change log (change data capture, CDC) for new rows. This count is tracked in your browser since the page opened, not stored on the server, so it resets to zero on reload.</p>
+            <div class="column-tray" id="tray-captured"></div>
+          </div>
+          <div class="column" data-column="queued">
+            <div class="column-header">
+              <span class="column-title">Waiting in line <span class="column-title-secondary">(queued)</span></span>
+              <span class="column-count" id="count-queued">0</span>
+            </div>
+            <p class="column-explain">Ready to be worked on, but no worker has taken it yet.</p>
+            <div class="column-tray" id="tray-queued"></div>
+          </div>
+          <div class="column" data-column="claimed">
+            <div class="column-header">
+              <span class="column-title">In progress <span class="column-title-secondary">(claimed)</span></span>
+              <span class="column-count" id="count-claimed">0</span>
+            </div>
+            <p class="column-explain">A worker has taken this file and is about to send it out for text extraction.</p>
+            <div class="column-tray" id="tray-claimed"></div>
+          </div>
+          <div class="column" data-column="ocr">
+            <div class="column-header">
+              <span class="column-title">Reading the text <span class="column-title-secondary">(text extraction, OCR)</span></span>
+              <span class="column-count" id="count-ocr">0</span>
+            </div>
+            <p class="column-explain">Waiting for text extraction. These files have been sent to the text extraction service, and they stay here until it returns the words it found.</p>
+            <div class="column-tray" id="tray-ocr"></div>
+          </div>
+          <div class="column" data-column="stored">
+            <div class="column-header">
+              <span class="column-title">Stored</span>
+              <span class="column-count" id="count-stored">0</span>
+            </div>
+            <p class="column-explain">Safely saved in the new home: the file's bytes in object storage, and its details, including the extracted text, in the new database.</p>
+            <div class="column-tray" id="tray-stored"></div>
+          </div>
+        </div>
+      </div>
+      <div class="failed-row" data-column="failed">
+        <div class="column-header">
+          <span class="column-title">Set aside <span class="column-title-secondary">(not currently in flight)</span></span>
+          <span class="column-count" id="count-failed">0</span>
+        </div>
+        <p class="column-explain">These files hit repeated errors and were set aside. This is not necessarily final: a later update to the same file can pick it back up and move it forward again.</p>
+        <div class="column-tray failed-tray" id="tray-failed"></div>
+      </div>
+      <div class="throughput-row">
+        <div class="throughput-item">
+          <span class="swatch swatch-cdc"></span>
+          <span class="throughput-label">live lane throughput</span>
+          <span class="throughput-value" id="throughput-cdc">0.0 files/s</span>
+        </div>
+        <div class="throughput-item">
+          <span class="swatch swatch-backfill"></span>
+          <span class="throughput-label">backfill throughput</span>
+          <span class="throughput-value" id="throughput-backfill">0.0 files/s</span>
+        </div>
+      </div>
+      <div class="throughput-row">
+        <div class="throughput-item">
+          <span class="swatch swatch-cdc"></span>
+          <span class="throughput-label">live lane queue depth</span>
+          <span class="throughput-value" id="queue-depth-cdc">0</span>
+        </div>
+        <div class="throughput-item">
+          <span class="swatch swatch-backfill"></span>
+          <span class="throughput-label">backfill queue depth</span>
+          <span class="throughput-value" id="queue-depth-backfill">0</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel sla-panel" aria-labelledby="sla-heading">
+      <div class="panel-header">
+        <h2 id="sla-heading">Freshness <span class="panel-title-secondary">(service level agreement, SLA)</span></h2>
+        <span class="sla-lag-value" id="sla-lag-value">0s outstanding</span>
+      </div>
+      <p class="panel-explain">How long the oldest unfinished live-lane file has been waiting. Green means on track, amber means it is approaching the target, red means it has missed it.</p>
+      <div class="gauge" id="sla-gauge">
+        <div class="gauge-track">
+          <div class="gauge-fill" id="gauge-fill"></div>
+          <div class="gauge-marker" id="gauge-marker-alert"></div>
+          <div class="gauge-marker gauge-marker-breach" id="gauge-marker-breach"></div>
+        </div>
+        <div class="gauge-scale">
+          <span>0</span>
+          <span id="gauge-alert-label">alert</span>
+          <span id="gauge-breach-label">breach</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel recent-panel" aria-labelledby="recent-heading">
+      <div class="panel-header">
+        <h2 id="recent-heading">Recently stored</h2>
+        <a class="minio-link" id="minio-link" href="http://localhost:9001/browser/documents" target="_blank" rel="noopener noreferrer">Open in MinIO console</a>
+      </div>
+      <p class="panel-explain">The most recently completed files, newest first. Each duration below is the file's real, measured end-to-end time, not the paced speed of the chips above.</p>
+      <div class="recent-grid" id="recent-grid"></div>
     </section>
   </main>
 

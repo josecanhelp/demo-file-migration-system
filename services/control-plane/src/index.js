@@ -13,8 +13,9 @@ const mysql = require('mysql2/promise');
 
 const { getStats } = require('./stats');
 const { EventTailer, makePostgresEventFetcher } = require('./events');
-const { insertFile } = require('./sources');
+const { insertFile, BulkCountError } = require('./sources');
 const { getTrace } = require('./trace');
+const { getRecent } = require('./recent');
 const { getVendorMode, setVendorMode, reconcile } = require('./proxy');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
@@ -109,8 +110,22 @@ app.post('/api/files', async (req, res) => {
     const result = await insertFile(mysqlPool, req.body || {});
     res.status(201).json(result);
   } catch (err) {
+    if (err instanceof BulkCountError) {
+      res.status(400).json({ code: 'INVALID_COUNT', message: err.message });
+      return;
+    }
     console.error('POST /api/files failed', err);
     res.status(500).json({ code: 'INSERT_FAILED', message: err.message });
+  }
+});
+
+app.get('/api/recent', async (req, res) => {
+  try {
+    const items = await getRecent(pgPool, req.query.limit);
+    res.status(200).json({ items });
+  } catch (err) {
+    console.error('GET /api/recent failed', err);
+    res.status(500).json({ code: 'RECENT_FAILED', message: err.message });
   }
 });
 

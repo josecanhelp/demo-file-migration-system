@@ -27,23 +27,35 @@ few stats ticks the pipeline should already show all 500 as stored.
 
 ## Dashboard walkthrough
 
-The dashboard is one page, served by the control plane at port 8080. Four things worth doing:
+The dashboard is one page, served by the control plane at port 8080, arranged top to bottom as
+Controls, Pipeline, Freshness, and Recently stored. Four things worth doing:
 
-**Watch a file traverse.** Click **Add a file**. It inserts a row directly into `sourcedb.files`,
-the same table any real application write would land in, so the new row is picked up by
-Debezium off the binlog like anything else. The Trace panel starts following that file's id and
-its chip moves across Source, Captured, Queued, Claimed, OCR, Stored as the events arrive over
-the live stream, each column's count updates in the header, and once it lands in Stored the
-trace panel shows the object key the file was written under along with a link to the MinIO
-console to look at it directly.
+**Add files and watch them travel.** The Controls panel at the top has four buttons: **Add 1
+file**, **Add 10 files**, **Add 100 files**, and **Add 1,000 files**. Each inserts that many rows
+directly into `sourcedb.files`, the same table any real application write would land in, so the
+new rows are picked up by Debezium off the binlog like anything else; a bulk click still issues
+one multi-row `INSERT`, not one request per file. Below, the Pipeline panel lays out six columns
+left to right, always in that order and never wrapping: Original files (source), Picked up
+(captured), Waiting in line (queued), In progress (claimed), Reading the text (text extraction,
+OCR), and Stored, plus a Set aside row for files that hit repeated errors. A plain sentence under
+each heading explains what that step means. On a narrow window the column strip scrolls
+sideways instead of stacking into extra rows, so the left-to-right order always reads the same
+way.
 
-**Watch the columns generally.** Source is the row count in MySQL. Captured is a session-local
-tally of CDC capture events seen since the page loaded, not a status bucket, since capture is a
-transient point between the source table and a claim rather than a status any row holds. Queued,
-Claimed, OCR, and Stored come straight from `migration_state` counts by status, so they never
-drift from the ledger. Below the columns, a Not currently in flight row lists files stuck at
-`FAILED_PERMANENT`; the hint under it is accurate, since a later update to that same row (on the
-CDC lane) revives it and the chip moves back into the in-flight trays.
+Every chip is paced to sit in each column for a moment before advancing, so even a file that
+finishes in well under a second still visibly steps through the whole pipeline; a note next to
+the legend says so. That pacing is purely visual: every count on screen still comes straight from
+`/api/stats` on the same tick it always did, so a slow-moving chip never makes a count lag behind
+reality.
+
+**Watch the columns generally.** Original files is the row count in MySQL. Picked up is a
+tally tracked in your browser of live-lane capture events seen since the page loaded, not a
+status bucket, since capture is a transient point between the source table and a claim rather
+than a status any row holds. Waiting in line, In progress, Reading the text, and Stored come
+straight from `migration_state` counts by status, so they never drift from the ledger. The Set
+aside row lists files stuck at `FAILED_PERMANENT`; the explanation under it is accurate, since a
+later update to that same row (on the live lane) revives it and the chip moves back into the
+in-flight columns.
 
 **Drive the vendor into failure and watch the breaker hold the line.** The Controls panel has a
 vendor mode selector: healthy, slow, rate_limited, erroring, down. Switch it to `down` (or
@@ -54,6 +66,14 @@ where they are; nothing is lost, nothing is retried into a wall. Switch the mode
 `healthy`; the breaker moves to HALF_OPEN, lets a few trial calls through, and once those succeed
 it closes and every paused consumer resumes on its own. The files queued up during the outage
 drain normally once it does.
+
+**Check freshness and browse what landed.** The Freshness panel (service level agreement, SLA)
+shows how long the oldest unfinished live-lane file has been waiting, against an alert and a
+breach marker. Below it, Recently stored shows the most recently completed files, newest first,
+each card showing the filename, where it landed (its object key), the extracted text, the OCR
+confidence, and its actual measured end-to-end duration, taken from that file's own event history
+rather than the pipeline's paced animation. A link to the MinIO console is available from the
+panel header to look at a stored object directly.
 
 **Run a reconciliation.** Click **Run reconciliation** (or `POST /api/reconcile`, see below). A
 `clean: true` result means the source table, the ledger, and the target document table agree not
@@ -91,8 +111,8 @@ is plumbed through `docker-compose.yml`.
 | `BACKFILL_TOPIC_PARTITIONS` | `3` | Partition count for the backfill Kafka topic. |
 | `WORKER_CONCURRENCY` | `8` | Kafka listener concurrency per lane inside `migrator-worker`, and an input to the JDBC pool size (see `DB_POOL_SIZE`). |
 | `MICROBATCH_MAX_WAIT_MS` | `500` | Reserved for tuning how long a consumer batches records before processing; not currently wired to any consumer, which claims each record as it arrives rather than batching by wait time. |
-| `SLA_TARGET_SECONDS` | `3600` | The SLA gauge's breach marker: how long a CDC-lane file may sit unresolved before the migration is missing its target. |
-| `SLA_ALERT_SECONDS` | `1800` | The SLA gauge's earlier alert marker, meant to fire before `SLA_TARGET_SECONDS` is reached. |
+| `SLA_TARGET_SECONDS` | `3600` | The Freshness panel's breach marker: how long a live-lane file may sit unresolved before the migration is missing its service level agreement (SLA) target. |
+| `SLA_ALERT_SECONDS` | `1800` | The Freshness panel's earlier alert marker, meant to fire before `SLA_TARGET_SECONDS` is reached. |
 | `BREAKER_FAILURE_RATE_THRESHOLD` | `50` | Failure rate percentage that trips the vendor circuit breaker open. |
 | `BREAKER_OPEN_DURATION_SECONDS` | `10` | How long the breaker stays open before moving to half-open and letting trial calls through. |
 | `MAX_RETRY_ATTEMPTS` | `5` | Two things at once: the Governor's per-call retry cap for a single vendor invocation, and the consecutive-failures cap past which a file is condemned to `FAILED_PERMANENT` (see the architecture doc for why that counter is not the same as lifetime attempts). |
@@ -104,7 +124,7 @@ is plumbed through `docker-compose.yml`.
 | `CLAIM_RENEW_INTERVAL_SECONDS` | `10` | How often an in-progress claim is renewed, keeping the lease well short of the time an actual crash takes to detect. |
 | `CONTROL_PLANE_PORT` | `8080` | Port the control plane (API, SSE stream, dashboard) listens on. |
 | `MIGRATOR_BASE_URL` | `http://migrator-worker:8082` | Where the control plane reaches a migrator worker to proxy the reconcile action. With more than one worker replica this resolves round-robin across all of them; reconcile is stateless against the shared databases, so it doesn't matter which one answers. |
-| `MINIO_CONSOLE_URL` | `http://localhost:9001` | The MinIO console address the dashboard's trace panel links to after a file lands in Stored. Served to the browser from `GET /api/config`, so it stays correct even when the console is reachable at an address other than the default. |
+| `MINIO_CONSOLE_URL` | `http://localhost:9001` | The MinIO console address the dashboard's Recently stored panel links to. Served to the browser from `GET /api/config`, so it stays correct even when the console is reachable at an address other than the default. |
 | `EVENT_POLL_INTERVAL_MS` | `500` | How often the control plane polls `migration_event` for new rows to push over SSE. |
 | `EVENT_POLL_LIMIT` | `500` | Max rows fetched per poll. |
 | `SSE_MAX_EVENTS_PER_TICK` | `200` | Max events forwarded to browsers per tick; anything past this is dropped for that tick and counted in the "dropped by the server" label rather than queued up. |
