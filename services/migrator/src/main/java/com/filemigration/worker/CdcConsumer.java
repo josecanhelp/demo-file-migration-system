@@ -124,6 +124,13 @@ public class CdcConsumer {
             switch (envelope.op()) {
                 case OP_CREATE, OP_READ -> {
                     ledger.seedPending(List.of(id), LANE, sourceCreatedAtMap(id, envelope));
+                    // Recorded once the row is seeded and before it is
+                    // handed to migrate(), the same "ready, not yet
+                    // claimed" moment the backfill lane's per-id QUEUED
+                    // event marks right after publishing to its topic, so
+                    // the dashboard's Waiting in line column means the same
+                    // thing on both lanes.
+                    eventRepo.record(id, Stage.QUEUED, LANE, null);
                     migrationService.migrate(List.of(id), LANE);
                 }
                 case OP_UPDATE -> {
@@ -136,6 +143,7 @@ public class CdcConsumer {
                     // being acknowledged with nothing done.
                     ledger.seedPending(List.of(id), LANE, sourceCreatedAtMap(id, envelope));
                     ledger.resetForUpdate(id, envelope.version());
+                    eventRepo.record(id, Stage.QUEUED, LANE, null);
                     migrationService.migrate(List.of(id), LANE);
                 }
                 case OP_DELETE -> {

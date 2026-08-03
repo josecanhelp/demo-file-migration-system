@@ -5,11 +5,11 @@
 // Column counts for Waiting in line, In progress, Reading the text, Stored
 // and the set-aside tray come straight from the stats snapshot every tick,
 // so they never drift, and the paced chip animation below never touches
-// them. The Picked up column has no matching status bucket (only the live
-// lane emits a capture event, and it is a transient point between source
-// and claim rather than a status any row holds), so it is tracked locally
-// from the pipeline stream instead, starting over at 0 on every page load;
-// the interface says so next to the column.
+// them. The Picked up column has no matching status bucket (both lanes
+// emit a capture event when they notice a file, but it is a transient
+// point between source and claim rather than a status any row holds), so
+// it is tracked locally from the pipeline stream instead, starting over at
+// 0 on every page load; the interface says so next to the column.
 //
 // A file completes in well under a second in reality, so a chip is paced
 // to sit in each column for at least PACED_DWELL_MS before advancing, and
@@ -25,7 +25,9 @@
 // counting chips or DLQ events, so it cannot say something different from
 // what the row's current status actually is. FAILED_PERMANENT is not final
 // on the live lane: a later real stage event for the same source id moves
-// its chip straight back into an in-flight column.
+// its chip straight back into an in-flight column. The tray itself stays
+// hidden while that same count is zero and reappears the moment it is not,
+// driven by the same stats value rather than by chip movement.
 
 (function () {
   const MAX_LIVE_CHIPS = 120;
@@ -43,6 +45,7 @@
 
   const stageToColumn = {
     CDC_CAPTURED: 'captured',
+    QUEUED: 'queued',
     CLAIMED: 'claimed',
     OCR_DONE: 'ocr',
     STORED: 'stored',
@@ -195,7 +198,9 @@
     setColumnCount('claimed', byStatus.IN_FLIGHT || 0);
     setColumnCount('ocr', byStatus.OCR_DONE || 0);
     setColumnCount('stored', byStatus.DONE || 0);
-    setColumnCount('failed', byStatus.FAILED_PERMANENT || 0);
+    const failedCount = byStatus.FAILED_PERMANENT || 0;
+    setColumnCount('failed', failedCount);
+    updateFailedTrayVisibility(failedCount);
 
     updateQueueDepth('cdc', byLane.cdc || 0);
     updateQueueDepth('backfill', byLane.backfill || 0);
@@ -216,6 +221,19 @@
     const el = document.getElementById('count-' + column);
     if (el) {
       el.textContent = String(value);
+    }
+  }
+
+  // The Set aside row is hidden while nothing is in it, since with only
+  // Vendor: working and Vendor: offline exposed on the dashboard a vendor
+  // failure is always classified transient and never lands a file here.
+  // It reappears the moment the count is genuinely non-zero, for example a
+  // file the vendor rejects outright as unreadable, and hides again once
+  // that clears.
+  function updateFailedTrayVisibility(count) {
+    const row = document.querySelector('.failed-row');
+    if (row) {
+      row.hidden = count <= 0;
     }
   }
 

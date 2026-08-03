@@ -37,6 +37,13 @@ class FakeEventRepository extends EventRepository {
         events.add(new Event(sourceId, stage, lane, detailJson));
     }
 
+    @Override
+    public void recordBatch(List<Long> sourceIds, Stage stage, String lane, String detailJson) {
+        for (Long sourceId : sourceIds) {
+            record(sourceId, stage, lane, detailJson);
+        }
+    }
+
     record Event(Long sourceId, Stage stage, String lane, String detailJson) {
     }
 }

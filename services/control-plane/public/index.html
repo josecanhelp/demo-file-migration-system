@@ -47,11 +47,8 @@
         <div class="control-group">
           <label for="vendor-mode-select">Vendor mode</label>
           <select id="vendor-mode-select">
-            <option value="healthy">healthy</option>
-            <option value="slow">slow</option>
-            <option value="rate_limited">rate_limited</option>
-            <option value="erroring">erroring</option>
-            <option value="down">down</option>
+            <option value="healthy">Vendor: working</option>
+            <option value="down">Vendor: offline</option>
           </select>
         </div>
         <div class="control-group">
@@ -90,7 +87,7 @@
               <span class="column-title">Picked up <span class="column-title-secondary">(captured)</span></span>
               <span class="column-count" id="count-captured">0</span>
             </div>
-            <p class="column-explain">Noticed by the live lane, which watches the database's change log (change data capture, CDC) for new rows. This count is tracked in your browser since the page opened, not stored on the server, so it resets to zero on reload.</p>
+            <p class="column-explain">Noticed by the migration, either by the live lane watching the database's change log (change data capture, CDC) for new rows, or by the backfill lane scanning the source table for rows it has not reached yet. This count is tracked in your browser since the page opened, not stored on the server, so it resets to zero on reload.</p>
             <div class="column-tray" id="tray-captured"></div>
           </div>
           <div class="column" data-column="queued">
@@ -127,12 +124,12 @@
           </div>
         </div>
       </div>
-      <div class="failed-row" data-column="failed">
+      <div class="failed-row" data-column="failed" hidden>
         <div class="column-header">
           <span class="column-title">Set aside <span class="column-title-secondary">(not currently in flight)</span></span>
           <span class="column-count" id="count-failed">0</span>
         </div>
-        <p class="column-explain">These files hit repeated errors and were set aside. This is not necessarily final: a later update to the same file can pick it back up and move it forward again.</p>
+        <p class="column-explain">These files hit repeated errors and were set aside. This is not necessarily final: a later update to the same file can pick it back up and move it forward again. Hidden while empty, since a vendor mode of working or offline never counts a vendor failure toward this; it appears the moment a file actually lands here, for example one the vendor rejects as unreadable.</p>
         <div class="column-tray failed-tray" id="tray-failed"></div>
       </div>
       <div class="throughput-row">

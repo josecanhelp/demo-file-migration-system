@@ -164,6 +164,13 @@ public class BackfillCoordinator {
             ids.add(row.id());
             createdAtById.put(row.id(), row.createdAt());
         }
+        // Recorded per id, not just once for the range: this is the moment
+        // the backfill lane actually notices each of these rows, the same
+        // thing CDC_CAPTURED marks on the live lane for a row it notices
+        // through the binlog instead. The dashboard's Picked up column
+        // reads this event from either lane so a file's route through it
+        // looks the same regardless of which lane found it.
+        eventRepo.recordBatch(ids, Stage.CDC_CAPTURED, LANE, null);
         List<List<Long>> chunks = Chunker.chunk(ids, vendorBatchSize);
         int published = 0;
         for (List<Long> chunk : chunks) {
@@ -172,6 +179,11 @@ public class BackfillCoordinator {
             // claim ids the ledger does not know about yet.
             ledger.seedPending(chunk, LANE, createdAtById);
             publish(chunk);
+            // Recorded per id right after the chunk that carries it is
+            // actually on the topic, so each file gets its own QUEUED
+            // event the moment it starts waiting there, alongside the
+            // range-level QUEUED event below.
+            eventRepo.recordBatch(chunk, Stage.QUEUED, LANE, null);
             published += chunk.size();
         }
         eventRepo.record(null, Stage.QUEUED, LANE, writeRangeDetail(range, ids.size()));

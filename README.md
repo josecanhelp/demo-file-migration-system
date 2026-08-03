@@ -49,23 +49,31 @@ the legend says so. That pacing is purely visual: every count on screen still co
 reality.
 
 **Watch the columns generally.** Original files is the row count in MySQL. Picked up is a
-tally tracked in your browser of live-lane capture events seen since the page loaded, not a
-status bucket, since capture is a transient point between the source table and a claim rather
-than a status any row holds. Waiting in line, In progress, Reading the text, and Stored come
-straight from `migration_state` counts by status, so they never drift from the ledger. The Set
-aside row lists files stuck at `FAILED_PERMANENT`; the explanation under it is accurate, since a
-later update to that same row (on the live lane) revives it and the chip moves back into the
-in-flight columns.
+tally tracked in your browser of capture events seen since the page loaded, from either lane
+(the live lane noticing a row through the binlog, or the backfill lane noticing one by scanning
+the source table), not a status bucket, since capture is a transient point between the source
+table and a claim rather than a status any row holds. Waiting in line, In progress, Reading the
+text, and Stored come straight from `migration_state` counts by status, so they never drift from
+the ledger. The Set aside row lists files stuck at `FAILED_PERMANENT`; the explanation under it
+is accurate, since a later update to that same row (on the live lane) revives it and the chip
+moves back into the in-flight columns. The row itself stays hidden while that count is zero and
+only appears once a file genuinely lands there.
 
 **Drive the vendor into failure and watch the breaker hold the line.** The Controls panel has a
-vendor mode selector: healthy, slow, rate_limited, erroring, down. Switch it to `down` (or
-`erroring`) and add a few files. Within a handful of failed calls the breaker pill in the top bar
-flips to OPEN, and every Kafka consumer container pauses rather than continuing to fail and retry
-against a vendor that has already told you it's unavailable. The files already in flight sit
-where they are; nothing is lost, nothing is retried into a wall. Switch the mode back to
-`healthy`; the breaker moves to HALF_OPEN, lets a few trial calls through, and once those succeed
-it closes and every paused consumer resumes on its own. The files queued up during the outage
-drain normally once it does.
+vendor mode selector with two plain-language options, Vendor: working and Vendor: offline, which
+send the vendor mock's real `healthy` and `down` modes underneath (the vendor mock also still
+answers to `slow`, `rate_limited`, and `erroring`, kept for the integration tests that exercise
+them, just not offered on the dashboard). Switch it to Vendor: offline and add a few files.
+Within a handful of failed calls the breaker pill in the top bar flips to OPEN, and every Kafka
+consumer container pauses rather than continuing to fail and retry against a vendor that has
+already told you it's unavailable. The files already in flight sit where they are; nothing is
+lost, nothing is retried into a wall. Switch the mode back to Vendor: working; the breaker moves
+to HALF_OPEN, lets a few trial calls through, and once those succeed it closes and every paused
+consumer resumes on its own. The files queued up during the outage drain normally once it does.
+Since only `healthy` and `down` are reachable from the dashboard, a vendor problem is always
+classified transient there and never counts toward a file's retry cap, so the Set aside row
+should stay empty in ordinary dashboard use; a file the vendor rejects outright as unreadable is
+a genuine `FAILED_PERMANENT` regardless of vendor mode and still lands there.
 
 **Check freshness and browse what landed.** The Freshness panel (service level agreement, SLA)
 shows how long the oldest unfinished live-lane file has been waiting, against an alert and a
@@ -96,7 +104,7 @@ is plumbed through `docker-compose.yml`.
 | `VENDOR_RATE_LIMIT_RPS` | `50` | The vendor mock's combined request budget per second, and the ceiling the migrator's rate limiter enforces across both lanes. |
 | `VENDOR_BATCH_SIZE` | `25` | Files per OCR call, on both sides: the vendor mock rejects a batch larger than this, and it is the chunk size the backfill coordinator uses when calling it. The CDC lane calls the vendor with one id per envelope and never chunks, since each envelope already represents a single row change. |
 | `VENDOR_LATENCY_MS` | `150` | Simulated per-call latency in the vendor's healthy mode; its slow mode multiplies this by 20. |
-| `VENDOR_FAILURE_MODE` | `healthy` | The vendor mock's boot-time chaos mode: `healthy`, `slow`, `rate_limited`, `erroring`, or `down`. Changeable at runtime via `POST /admin/mode` (or the dashboard's vendor mode selector) without a restart. |
+| `VENDOR_FAILURE_MODE` | `healthy` | The vendor mock's boot-time chaos mode: `healthy`, `slow`, `rate_limited`, `erroring`, or `down`. Changeable at runtime via `POST /admin/mode` without a restart; the dashboard's own vendor mode selector only offers `healthy` (labeled Vendor: working) and `down` (labeled Vendor: offline), the two the integration tests do not already cover on their own. |
 | `VENDOR_BASE_URL` | `http://vendor-mock:8088` | Where the migrator and the control plane reach the vendor mock. |
 | `VENDOR_CONNECT_TIMEOUT_MS` | `2000` | Connect timeout for a vendor call. |
 | `VENDOR_READ_TIMEOUT_MS` | `10000` | Read timeout for a vendor call; `slow` mode's 20x latency multiplier is tuned to stay under this so a slow vendor is observably slow rather than simply timing out. |
