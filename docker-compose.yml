@@ -182,22 +182,18 @@ services:
   # One-shot registration of the CDC connector. Waits for Connect's REST
   # API to answer, then POSTs infra/debezium/connector.json. HTTP 409
   # (the connector already exists) is treated as success so restarting
-  # the whole stack never fails this step. Depends on migrator-worker
-  # being healthy, not just Connect: migrator-worker's KafkaAdmin bean
-  # declares the CDC topic with its configured partition count during
-  # context refresh, before the app can ever report healthy, so a
-  # healthy worker is what makes it safe for register-connector.sh to
-  # assume the topic already exists exactly as configured rather than
-  # racing the Debezium connector task to create it first at the
-  # broker's own default. Reuses the same image the kafka service runs,
-  # since it already carries both curl and kafka-topics.
+  # the whole stack never fails this step. register-connector.sh creates
+  # the CDC topic itself, at its configured partition count, before ever
+  # registering the connector, so this depends only on Connect being up,
+  # not on migrator-worker or migrator-coordinator: neither needs to be
+  # running for the connector to come up correctly. Reuses the same
+  # image the kafka service runs, since it already carries both curl and
+  # kafka-topics.
   connector-init:
     image: confluentinc/cp-kafka:7.6.1
     container_name: connector-init
     depends_on:
       connect:
-        condition: service_healthy
-      migrator-worker:
         condition: service_healthy
     volumes:
       - ./infra/debezium:/infra/debezium:ro

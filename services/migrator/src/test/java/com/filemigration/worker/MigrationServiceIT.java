@@ -7,6 +7,7 @@ import com.filemigration.store.EventRepository;
 import com.filemigration.store.LedgerRepository;
 import com.filemigration.store.ObjectStore;
 import com.filemigration.store.SourceFileRepository;
+import com.filemigration.testsupport.IsolatedStackPreflight;
 import com.filemigration.vendor.OcrResult;
 import com.filemigration.vendor.VendorClient;
 import com.zaxxer.hikari.HikariDataSource;
@@ -76,6 +77,7 @@ class MigrationServiceIT {
 
     @BeforeAll
     static void connect() {
+        IsolatedStackPreflight.verify();
         String targetUrl = System.getenv().getOrDefault("TARGET_JDBC_URL",
                 "jdbc:postgresql://localhost:5432/targetdb");
         String targetUser = System.getenv().getOrDefault("TARGET_JDBC_USERNAME", "postgres");

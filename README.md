@@ -203,16 +203,37 @@ cd services/migrator && mvn test
 ```
 
 Integration tests for the migrator (the stack must already be up via `docker compose up`, since
-these tests hit the real MySQL, Postgres, MinIO, Kafka, vendor mock, and migrator-worker):
+these tests hit the real MySQL, Postgres, MinIO, Kafka, vendor mock, and the real Debezium
+connector):
 
 ```bash
+docker compose stop migrator-worker migrator-coordinator
 cd services/migrator && mvn verify
 ```
 
-The reconcile tests reach the migrator through the control plane's published, never-scaled port
-(`http://localhost:8080`) rather than guessing at `migrator-worker`'s own ephemeral one; `RECONCILE_URL`
-and `RECONCILE_HEALTH_URL` override that if you want to point them at one specific worker instance
-directly instead.
+Stop `migrator-worker` and `migrator-coordinator` first, every time, even though `docker compose up`
+starts them. Every integration test that needs a worker or a reconciler wires one up directly
+inside its own test JVM rather than depending on the containerized one, and the containerized
+worker and coordinator go right on consuming the real backfill and cdc topics in the background
+regardless. Since every id an integration test seeds is a real row in MySQL, the real Debezium
+connector captures it into the real `cdc.sourcedb.files` topic no matter which suite's reserved id
+range it falls in, and a live worker or coordinator claims and processes it on its own retry cap,
+independently of the test that seeded it. That can condemn a test's own id to `FAILED_PERMANENT`
+before the test's own consumer ever claims it, which fails the test for a reason that has nothing
+to do with what it is actually checking. The suite refuses to guess around this: each integration
+test class that writes to the source database checks, before it does anything else, whether a
+containerized worker or coordinator is running, and fails immediately with a one-line message
+naming the `docker compose stop` command above if it finds one, rather than letting the failure
+surface later as an unexplained retry-cap error.
+
+`docker compose up` still starts `migrator-worker` and `migrator-coordinator` unchanged, since
+demoing the project depends on them actually migrating the seeded corpus; only running the
+integration suite against that same stack requires stopping them first.
+
+Reconcile tests build their own `ReconcileService` directly against the same JDBC and object store
+connections the rest of that test class uses, rather than going through the control plane's HTTP
+proxy to a running `migrator-worker`, so they need nothing beyond the databases and object store
+already listed above.
 
 Tests for the control plane:
 

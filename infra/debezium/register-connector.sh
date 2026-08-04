@@ -1,11 +1,12 @@
 #!/bin/sh
-# Verifies the CDC topic already exists with the partition count this
-# stack expects, then registers the CDC connector with a running Kafka
-# Connect worker. Waits for Connect's REST API to answer before posting,
-# then treats the connector already existing (HTTP 409) as success so
-# re-running this on every `docker compose up` restart never fails the
-# step. Exits non-zero for anything else, including a Connect that never
-# comes up within the wait budget.
+# Creates the CDC topic at the partition count this stack expects if it
+# does not exist yet, verifies it landed at that count either way, then
+# registers the CDC connector with a running Kafka Connect worker. Waits
+# for Connect's REST API to answer before posting, then treats the
+# connector already existing (HTTP 409) as success so re-running this on
+# every `docker compose up` restart never fails the step. Exits non-zero
+# for anything else, including a Connect that never comes up within the
+# wait budget.
 set -eu
 
 CONNECT_URL="${CONNECT_URL:-http://connect:8083}"
@@ -19,13 +20,20 @@ MAX_WAIT_SECONDS="${MAX_WAIT_SECONDS:-120}"
 # the moment anything first produces to a name that does not exist yet.
 # If the Debezium connector task ever won the race to be the first writer
 # to this topic, it would silently revert to that default (often just 1)
-# instead of the count migrator-worker's KafkaAdmin declares, and a
-# single row this consumer cannot resolve would then block every other
-# row waiting behind it on the topic's only partition. Registering the
-# connector before confirming the topic already has the expected
-# partition count would let that regression pass unnoticed, so this
-# fails the whole stack instead.
-echo "Verifying ${CDC_TOPIC} already exists with ${CDC_TOPIC_PARTITIONS} partition(s)"
+# instead of the configured count, and a single row this consumer cannot
+# resolve would then block every other row waiting behind it on the
+# topic's only partition. Creating the topic here, before the connector
+# is ever registered, wins that race outright rather than merely
+# checking who won it; migrator-worker and migrator-coordinator each
+# declare this same topic on their own startup too, but this script no
+# longer depends on either one of them having done so first, so this
+# step, and the connector registration after it, runs the same way
+# whether or not that container happens to be up.
+echo "Creating ${CDC_TOPIC} with ${CDC_TOPIC_PARTITIONS} partition(s) if it does not already exist"
+kafka-topics --bootstrap-server "${KAFKA_BOOTSTRAP_SERVERS}" \
+  --create --if-not-exists --topic "${CDC_TOPIC}" --partitions "${CDC_TOPIC_PARTITIONS}" --replication-factor 1
+
+echo "Verifying ${CDC_TOPIC} exists with ${CDC_TOPIC_PARTITIONS} partition(s)"
 if ! describe_output=$(kafka-topics --bootstrap-server "${KAFKA_BOOTSTRAP_SERVERS}" \
     --describe --topic "${CDC_TOPIC}" 2>&1); then
   echo "Failed to describe topic ${CDC_TOPIC}; it must already exist before the connector is registered:"

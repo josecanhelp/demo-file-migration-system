@@ -3,6 +3,7 @@ package com.filemigration.governor;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.filemigration.backfill.BackfillMessage;
 import com.filemigration.store.ObjectStore;
+import com.filemigration.testsupport.IsolatedStackPreflight;
 import io.github.resilience4j.circuitbreaker.CircuitBreaker;
 import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.admin.AdminClientConfig;
@@ -125,6 +126,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class GovernorIT {
 
+    // Runs at class-load time, before this class's @SpringBootTest context
+    // (and the real database connections it opens) ever gets a chance to
+    // start, since @TestInstance(PER_CLASS) below creates this class's one
+    // instance, and with it that context, before any @BeforeAll method
+    // runs.
+    static {
+        IsolatedStackPreflight.verify();
+    }
+
     private static final String BACKFILL_TOPIC = "files.backfill.governor-it";
     private static final String BACKFILL_GROUP_ID = "backfill-governor-it";
     private static final String CDC_TOPIC = "cdc.sourcedb.files.governor-it";
@@ -148,6 +158,15 @@ class GovernorIT {
     private static final Duration DETECTION_TIMEOUT = Duration.ofSeconds(40);
     private static final Duration RECOVERY_TIMEOUT = Duration.ofSeconds(30);
     private static final Duration POLL_INTERVAL = Duration.ofMillis(250);
+    /**
+     * How long to wait for a DLQ migration_event row after its status
+     * update is already visible. deadLetter() writes the migration_state
+     * status and the migration_event row as two separate statements, not
+     * one transaction, so the row briefly reads FAILED_PERMANENT before
+     * the event commits; this bounds that gap instead of asserting on it
+     * at the instant the status flips.
+     */
+    private static final Duration DLQ_EVENT_TIMEOUT = Duration.ofSeconds(10);
     /** How long cleanup waits for both lanes to finish committing every message before it is safe to delete. */
     private static final Duration LANE_DRAIN_TIMEOUT = Duration.ofSeconds(40);
     /** How long the range this test just cleaned must read empty, continuously, before cleanup calls it done. */
@@ -619,7 +638,7 @@ class GovernorIT {
         assertEquals(1, targetJdbc.queryForObject(
                 "SELECT attempts FROM migration_state WHERE source_id = ?", Integer.class, id),
                 "an unprocessable document must fail on its first and only attempt");
-        assertEquals(1, countEventsForId(id, "DLQ"));
+        waitForDlqEvent(id);
         assertEquals(stateBefore, vendorCircuitBreaker.getState(),
                 "a document the vendor rejects as unprocessable is not a vendor outage and must never move the "
                         + "breaker");
@@ -657,7 +676,7 @@ class GovernorIT {
         waitUntil(() -> "FAILED_PERMANENT".equals(statusOf(id)), DETECTION_TIMEOUT,
                 "source_id " + id + " never reached FAILED_PERMANENT; it would otherwise nack forever and block "
                         + "every other change queued behind it on the same partition");
-        assertEquals(1, countEventsForId(id, "DLQ"));
+        waitForDlqEvent(id);
         Integer consecutiveFailures = targetJdbc.queryForObject(
                 "SELECT consecutive_failures FROM migration_state WHERE source_id = ?", Integer.class, id);
         assertTrue(consecutiveFailures >= 3, "the id must have actually been retried up to the configured cap, "
@@ -695,7 +714,7 @@ class GovernorIT {
                         + "matching source id is redelivered with the same version on every nack, and would "
                         + "otherwise nack forever instead of ever accumulating enough consecutive failures to "
                         + "reach the cap");
-        assertEquals(1, countEventsForId(id, "DLQ"));
+        waitForDlqEvent(id);
         Integer consecutiveFailures = targetJdbc.queryForObject(
                 "SELECT consecutive_failures FROM migration_state WHERE source_id = ?", Integer.class, id);
         assertTrue(consecutiveFailures >= 3, "the id must have actually been retried up to the configured cap, "
@@ -786,6 +805,12 @@ class GovernorIT {
         Long count = targetJdbc.queryForObject(
                 "SELECT count(*) FROM migration_event WHERE source_id = ? AND stage = ?", Long.class, id, stage);
         return count == null ? 0 : count;
+    }
+
+    /** Waits for exactly one DLQ event to land for id, per the DLQ_EVENT_TIMEOUT javadoc above. */
+    private void waitForDlqEvent(long id) {
+        waitUntil(() -> countEventsForId(id, "DLQ") == 1, DLQ_EVENT_TIMEOUT,
+                "source_id " + id + " reached a terminal status but never recorded exactly one DLQ migration_event");
     }
 
     /**

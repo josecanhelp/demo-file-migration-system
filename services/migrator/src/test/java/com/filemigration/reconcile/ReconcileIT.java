@@ -1,15 +1,17 @@
 package com.filemigration.reconcile;
 
+import com.filemigration.store.DocumentRepository;
+import com.filemigration.store.LedgerRepository;
 import com.filemigration.store.ObjectStore;
+import com.filemigration.store.SourceFileRepository;
+import com.filemigration.testsupport.IsolatedStackPreflight;
 import com.zaxxer.hikari.HikariDataSource;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.jdbc.DataSourceBuilder;
-import org.springframework.http.client.SimpleClientHttpRequestFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.web.client.RestClient;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
@@ -33,10 +35,9 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Exercises the reconciler through the control plane's HTTP proxy, the real
- * migrator-worker process it forwards to, and the real Postgres, MySQL, and
- * MinIO docker compose starts, proving it can both report a clean migration
- * and catch the corruption each test below introduces on purpose: a stale
+ * Exercises the reconciler against the real Postgres, MySQL, and MinIO
+ * docker compose starts, proving it can both report a clean migration and
+ * catch the corruption each test below introduces on purpose: a stale
  * checksum column, OCR text that no longer
  * matches the source, a document row's object missing from the store
  * entirely, a document row's object present but holding the wrong bytes, a
@@ -52,6 +53,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * unreadableObjects); there is no reliable way to make MinIO fail that
  * way on demand in this environment.
  *
+ * This class drives its own ReconcileService instance directly against the
+ * same JDBC and object store connections every other constructor here
+ * uses, rather than going through the control plane's HTTP proxy to a
+ * containerized migrator-worker: the reconciler's own logic has no
+ * dependency on that process being up, and calling it in-process means
+ * this class needs nothing running beyond the databases and object store
+ * it already connects to.
+ *
  * Every corruption test writes its own row under a reserved id range, well
  * clear of the ids the real seeded migration and every other suite in this
  * project use, so it never disturbs that migration's own counts other than
@@ -59,6 +68,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * removed again in @AfterEach, whether or not the test passed.
  */
 class ReconcileIT {
+
+    static {
+        IsolatedStackPreflight.verify();
+    }
 
     private static final long BASE_ID = 9_700_000L;
 
@@ -74,8 +87,8 @@ class ReconcileIT {
     private static final long RESERVED_RANGE_FLOOR = 9_000_000L;
 
     private static final String BUCKET = "documents";
-    private static final int CONNECT_TIMEOUT_MS = 2000;
-    private static final int READ_TIMEOUT_MS = 60000;
+    /** Unused by any read path ReconcileService exercises; only claim() needs it. */
+    private static final long LEDGER_LEASE_SECONDS = 300L;
 
     private static HikariDataSource targetDataSource;
     private static HikariDataSource sourceDataSource;
@@ -83,8 +96,7 @@ class ReconcileIT {
     private static JdbcTemplate sourceJdbc;
     private static S3Client s3Client;
     private static ObjectStore objectStore;
-    private static RestClient httpClient;
-    private static String reconcileUrl;
+    private static ReconcileService reconcileService;
 
     private boolean wroteToSourceTable;
 
@@ -133,31 +145,10 @@ class ReconcileIT {
                 .build();
         objectStore = new ObjectStore(s3Client, BUCKET);
 
-        // Defaults to the control plane's own published port and its proxy
-        // route, not to migrator-worker directly: migrator-worker is the one
-        // service `docker compose up --scale migrator-worker=N` runs more
-        // than one of, so it publishes an ephemeral host port that changes
-        // on every start and cannot be hard-coded here. The control plane's
-        // port never changes and is never scaled, and its /api/reconcile
-        // route forwards the request and hands back the worker's response
-        // body unchanged, so hitting it is equivalent to hitting the worker
-        // directly. RECONCILE_HEALTH_URL and RECONCILE_URL each override
-        // independently for anyone who wants to bypass the proxy and talk
-        // to one specific worker instance instead, at
-        // http://localhost:<port>/actuator/health and .../internal/reconcile.
-        String healthUrl = System.getenv().getOrDefault("RECONCILE_HEALTH_URL", "http://localhost:8080/health");
-        reconcileUrl = System.getenv().getOrDefault("RECONCILE_URL", "http://localhost:8080/api/reconcile");
-        SimpleClientHttpRequestFactory requestFactory = new SimpleClientHttpRequestFactory();
-        requestFactory.setConnectTimeout(CONNECT_TIMEOUT_MS);
-        requestFactory.setReadTimeout(READ_TIMEOUT_MS);
-        httpClient = RestClient.builder()
-                .requestFactory(requestFactory)
-                .build();
-        // Deliberately not wrapped in try/catch, same reasoning as the two
-        // JDBC checks above: if the control plane (or whatever this was
-        // overridden to point at) is not reachable, fail loudly here rather
-        // than deep inside the first test's own assertions.
-        httpClient.get().uri(healthUrl).retrieve().toBodilessEntity();
+        int reconcileBatchSize = Integer.parseInt(System.getenv().getOrDefault("RECONCILE_BATCH_SIZE", "500"));
+        reconcileService = new ReconcileService(new SourceFileRepository(sourceJdbc),
+                new LedgerRepository(targetJdbc, LEDGER_LEASE_SECONDS), new DocumentRepository(targetJdbc),
+                objectStore, reconcileBatchSize);
     }
 
     @AfterAll
@@ -274,8 +265,12 @@ class ReconcileIT {
 
     /**
      * The real seeded migration this docker compose stack already ran end
-     * to end. Polls rather than asserting on the first response, since the
-     * backfill lane may still be finishing when this suite starts. Every
+     * to end, if the stack this run is pointed at seeded and migrated one;
+     * an empty corpus (zero rows below RESERVED_RANGE_FLOOR on every side)
+     * reconciles clean too, trivially, which is exactly right when nothing
+     * seeded it in the first place. Polls rather than asserting on the
+     * first response, since the backfill lane may still be finishing when
+     * this suite starts. Every
      * list-based assertion is scoped to ids below RESERVED_RANGE_FLOOR
      * rather than to the endpoint's raw, unscoped lists: this suite runs
      * alongside others (GovernorIT, BackfillIT, CdcIT, and more) that
@@ -663,7 +658,7 @@ class ReconcileIT {
     }
 
     private ReconcileResult reconcile() {
-        return httpClient.post().uri(reconcileUrl).retrieve().body(ReconcileResult.class);
+        return reconcileService.reconcile();
     }
 
     private ReconcileResult waitUntilSeededCorpusClean(Duration timeout) {

@@ -1,12 +1,20 @@
 name: Integration
 
-# The migrator's full integration suite, brought up against the real
-# compose stack: MySQL, Postgres, Kafka, Connect, MinIO, and the vendor
-# mock, exercised end to end the same way docs/README.md describes running
-# it by hand. This workflow does NOT gate a deploy; deploy.yml only waits
-# on fast unit tests and a compose config check. Running here on every
-# pull request and once a night is what keeps this coverage automatic
-# without it blocking every push to main.
+# The migrator's integration suite, brought up against the real
+# infrastructure it needs: MySQL, Postgres, Kafka, Connect (the real
+# Debezium connector), MinIO, and the vendor mock, exercised end to end
+# the same way docs/README.md describes running it by hand. Deliberately
+# does not start migrator-worker or migrator-coordinator: every suite that
+# needs a worker or a reconciler wires one up directly inside its own test
+# JVM, and a live containerized worker or coordinator would consume the
+# same real backfill and cdc topics on its own schedule, independently of
+# any test's lifecycle, and can claim and condemn a suite's own source ids
+# before that suite's own consumer ever sees them. See README.md's testing
+# section for the same requirement spelled out for local runs. This
+# workflow does NOT gate a deploy; deploy.yml only waits on fast unit
+# tests and a compose config check. Running here on every pull request and
+# once a night is what keeps this coverage automatic without it blocking
+# every push to main.
 on:
   pull_request:
   schedule:
@@ -29,10 +37,10 @@ jobs:
           cache: maven
           cache-dependency-path: services/migrator/pom.xml
 
-      - name: Bring up the full stack
+      - name: Bring up the infrastructure the tests need
         run: |
           cp .env.example .env
-          docker compose up -d --build
+          docker compose up -d --build mysql postgres minio minio-init kafka vendor-mock connect connector-init
           for i in $(seq 1 60); do
             unhealthy=$(docker compose ps --format '{{.Health}}' | grep -vc '^healthy$' || true)
             if [ "$unhealthy" -eq 0 ]; then
