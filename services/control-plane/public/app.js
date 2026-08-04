@@ -69,6 +69,7 @@
 
   let bulkRequestInFlight = false;
   let vendorRequestInFlight = false;
+  let restartRequestInFlight = false;
   let minioConsoleUrl = 'http://localhost:9001';
   let renderedRecentIds = new Set();
 
@@ -607,11 +608,24 @@
   function wireControls() {
     const addFileHint = document.getElementById('add-file-hint');
     const addButtons = Array.prototype.slice.call(document.querySelectorAll('[data-add-count]'));
+    const vendorSelect = document.getElementById('vendor-mode-select');
+    const reconcileBtn = document.getElementById('reconcile-btn');
+    const restartBtn = document.getElementById('restart-btn');
 
     function setButtonsDisabled(disabled) {
       addButtons.forEach(function (btn) {
         btn.disabled = disabled;
       });
+    }
+
+    // Used while a restart is running: every other control is disabled for
+    // its duration, since a restart wipes the exact tables an add, a
+    // vendor mode change, or a reconciliation would otherwise touch.
+    function setAllControlsDisabled(disabled) {
+      setButtonsDisabled(disabled);
+      vendorSelect.disabled = disabled;
+      reconcileBtn.disabled = disabled;
+      restartBtn.disabled = disabled;
     }
 
     addButtons.forEach(function (btn) {
@@ -652,7 +666,6 @@
       });
     });
 
-    const vendorSelect = document.getElementById('vendor-mode-select');
     vendorSelect.addEventListener('change', async function () {
       vendorRequestInFlight = true;
       try {
@@ -672,7 +685,6 @@
       }
     });
 
-    const reconcileBtn = document.getElementById('reconcile-btn');
     const reconcileHint = document.getElementById('reconcile-hint');
     reconcileBtn.addEventListener('click', async function () {
       reconcileBtn.disabled = true;
@@ -694,6 +706,62 @@
         reconcileHint.textContent = 'request failed';
       } finally {
         reconcileBtn.disabled = false;
+      }
+    });
+
+    // Restart demo. Destructive, so a single click never fires it: the
+    // first click only arms it, swapping the label to a short-lived
+    // confirmation state, and only a second click within that window
+    // actually calls the endpoint. Any other outcome (the timeout elapsing,
+    // or the request itself finishing) puts the button back to its
+    // resting label.
+    const RESTART_CONFIRM_TIMEOUT_MS = 4000;
+    const restartHint = document.getElementById('restart-hint');
+    const restartBtnDefaultLabel = restartBtn.textContent;
+    let restartArmed = false;
+    let restartConfirmTimer = null;
+
+    function disarmRestart() {
+      restartArmed = false;
+      restartBtn.textContent = restartBtnDefaultLabel;
+      restartBtn.classList.remove('confirming');
+      if (restartConfirmTimer) {
+        clearTimeout(restartConfirmTimer);
+        restartConfirmTimer = null;
+      }
+    }
+
+    restartBtn.addEventListener('click', async function () {
+      if (restartRequestInFlight) {
+        return;
+      }
+
+      if (!restartArmed) {
+        restartArmed = true;
+        restartBtn.textContent = 'Click again to confirm';
+        restartBtn.classList.add('confirming');
+        restartHint.textContent = '';
+        restartConfirmTimer = setTimeout(disarmRestart, RESTART_CONFIRM_TIMEOUT_MS);
+        return;
+      }
+
+      disarmRestart();
+      restartRequestInFlight = true;
+      setAllControlsDisabled(true);
+      restartHint.textContent = 'restarting...';
+      try {
+        const res = await fetch('/api/restart', { method: 'POST' });
+        const body = await res.json();
+        if (!res.ok) {
+          restartHint.textContent = 'failed: ' + (body.message || res.status);
+        } else {
+          restartHint.textContent = 'reloaded ' + body.filesReloaded + ' files';
+        }
+      } catch (err) {
+        restartHint.textContent = 'request failed';
+      } finally {
+        restartRequestInFlight = false;
+        setAllControlsDisabled(false);
       }
     });
   }

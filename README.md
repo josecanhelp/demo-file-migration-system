@@ -28,9 +28,25 @@ few stats ticks the pipeline should already show all 500 as stored.
 ## Dashboard walkthrough
 
 The dashboard is one page, served by the control plane at port 8080, arranged top to bottom as
-Controls, Pipeline, Freshness, and Recently stored. Four things worth doing:
+What this page shows, Controls, Pipeline, Freshness, and Recently stored. The first panel is a
+short, plain-language summary of the same five things this walkthrough covers in more detail
+below, aimed at someone opening the page for the first time. Five things worth doing:
 
-**Add files and watch them travel.** The Controls panel at the top has four buttons: **Add 1
+**Start clean with Restart demo.** The Controls panel has a **Restart demo** button, styled
+differently from the rest of the row since it is destructive. A single click does not fire it: it
+first changes the button to **Click again to confirm** for a few seconds, and only a second click
+in that window calls `POST /api/restart`. That endpoint truncates `sourcedb.files` (so
+`AUTO_INCREMENT` restarts at 1), clears `document`, `migration_state`, `migration_event`, and
+`backfill_checkpoint` in Postgres, deletes every object under the `files/` prefix in the MinIO
+`documents` bucket, resets the vendor mode to healthy, and reinserts the same `SEED_FILE_COUNT`
+files the seeder itself produces, using the same deterministic generator, in batches rather than
+one insert per file. It returns as soon as the reload is written, not once every file has migrated
+again, so the response is quick even though the dashboard then shows the reloaded files travel
+through the pipeline like any other write. Because the source table is truncated while the CDC
+lane is live, the reloaded files flow through the live lane rather than the backfill lane; that is
+expected. Every other control is disabled while a restart is running.
+
+**Add files and watch them travel.** The Controls panel also has four buttons: **Add 1
 file**, **Add 10 files**, **Add 100 files**, and **Add 1,000 files**. Each inserts that many rows
 directly into `sourcedb.files`, the same table any real application write would land in, so the
 new rows are picked up by Debezium off the binlog like anything else; a bulk click still issues
@@ -96,9 +112,9 @@ is plumbed through `docker-compose.yml`.
 
 | Variable | Default | Controls |
 | --- | --- | --- |
-| `SEED_FILE_COUNT` | `500` | Target row count the one-shot seeder tops `sourcedb.files` up to. Already-present rows are left alone, so re-running the seeder against a table with 500 rows and a target of 500 does nothing. |
-| `SEED_FILE_SIZE_BYTES` | `2048` | Size in bytes of each synthetic file the seeder generates. |
-| `SEED_BATCH_SIZE` | `500` | Rows per multi-row `INSERT` while seeding. |
+| `SEED_FILE_COUNT` | `500` | Target row count the one-shot seeder tops `sourcedb.files` up to. Already-present rows are left alone, so re-running the seeder against a table with 500 rows and a target of 500 does nothing. Also how many files `POST /api/restart` reloads. |
+| `SEED_FILE_SIZE_BYTES` | `2048` | Size in bytes of each synthetic file the seeder generates. Also used by `POST /api/restart` when it reloads the corpus, through the control plane's own copy of the same generator (see `services/control-plane/src/document.js`). |
+| `SEED_BATCH_SIZE` | `500` | Rows per multi-row `INSERT` while seeding, and while `POST /api/restart` reinserts. |
 | `SEED_PROGRESS_LOG_INTERVAL` | `5000` | How often (in rows) the seeder logs progress. |
 | `SEED_CONNECT_RETRIES` | `30` | How many times the seeder retries its first MySQL connection, a second apart, before giving up. A passing healthcheck does not guarantee the server accepts a connection the instant it reports healthy. |
 | `VENDOR_RATE_LIMIT_RPS` | `50` | The vendor mock's combined request budget per second, and the ceiling the migrator's rate limiter enforces across both lanes. |

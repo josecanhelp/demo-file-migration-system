@@ -17,6 +17,7 @@ const { insertFile, BulkCountError } = require('./sources');
 const { getTrace } = require('./trace');
 const { getRecent } = require('./recent');
 const { getVendorMode, setVendorMode, reconcile } = require('./proxy');
+const { restart, makeS3Client } = require('./restart');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 
@@ -35,6 +36,21 @@ const POSTGRES_DATABASE = process.env.POSTGRES_DATABASE || 'targetdb';
 const VENDOR_BASE_URL = process.env.VENDOR_BASE_URL || 'http://vendor-mock:8088';
 const MIGRATOR_BASE_URL = process.env.MIGRATOR_BASE_URL || 'http://migrator-worker:8082';
 const MINIO_CONSOLE_URL = process.env.MINIO_CONSOLE_URL || 'http://localhost:9001';
+
+// Object store access for the restart endpoint only (clearing files/ before
+// reload). Same values migrator-worker and migrator-coordinator already
+// connect with, just not previously needed by this service.
+const MINIO_ENDPOINT = process.env.MINIO_ENDPOINT || 'http://minio:9000';
+const MINIO_ACCESS_KEY = process.env.MINIO_ACCESS_KEY || 'minioadmin';
+const MINIO_SECRET_KEY = process.env.MINIO_SECRET_KEY || 'minioadmin';
+const MINIO_BUCKET = process.env.MINIO_BUCKET || 'documents';
+const MINIO_REGION = process.env.MINIO_REGION || 'us-east-1';
+
+// The same corpus size and shape the seeder uses, so a restart reloads
+// exactly what a fresh `docker compose up` would have seeded.
+const SEED_FILE_COUNT = parseInt(process.env.SEED_FILE_COUNT || '500', 10);
+const SEED_FILE_SIZE_BYTES = parseInt(process.env.SEED_FILE_SIZE_BYTES || '2048', 10);
+const SEED_BATCH_SIZE = parseInt(process.env.SEED_BATCH_SIZE || '500', 10);
 
 const EVENT_POLL_INTERVAL_MS = parseInt(process.env.EVENT_POLL_INTERVAL_MS || '500', 10);
 const EVENT_POLL_LIMIT = parseInt(process.env.EVENT_POLL_LIMIT || '500', 10);
@@ -58,6 +74,13 @@ const mysqlPool = mysql.createPool({
   user: MYSQL_USER,
   password: MYSQL_PASSWORD,
   database: MYSQL_DATABASE,
+});
+
+const s3Client = makeS3Client({
+  endpoint: MINIO_ENDPOINT,
+  region: MINIO_REGION,
+  accessKeyId: MINIO_ACCESS_KEY,
+  secretAccessKey: MINIO_SECRET_KEY,
 });
 
 const app = express();
@@ -156,6 +179,38 @@ app.post('/api/reconcile', async (req, res) => {
   } catch (err) {
     console.error('POST /api/reconcile failed', err);
     res.status(502).json({ code: 'MIGRATOR_UNREACHABLE', message: err.message });
+  }
+});
+
+// Guards against two restarts running at once, for example a second tab's
+// confirmed click landing while the first is still clearing tables. Not
+// meant to survive a process restart: it is a courtesy against overlap
+// within one running control plane, not a durable lock.
+let restartInProgress = false;
+
+app.post('/api/restart', async (req, res) => {
+  if (restartInProgress) {
+    res.status(409).json({ code: 'RESTART_IN_PROGRESS', message: 'a restart is already running' });
+    return;
+  }
+  restartInProgress = true;
+  try {
+    const summary = await restart({
+      pgPool,
+      mysqlPool,
+      s3Client,
+      bucket: MINIO_BUCKET,
+      vendorBaseUrl: VENDOR_BASE_URL,
+      fileCount: SEED_FILE_COUNT,
+      fileSizeBytes: SEED_FILE_SIZE_BYTES,
+      batchSize: SEED_BATCH_SIZE,
+    });
+    res.status(200).json(summary);
+  } catch (err) {
+    console.error('POST /api/restart failed', err);
+    res.status(500).json({ code: 'RESTART_FAILED', message: err.message });
+  } finally {
+    restartInProgress = false;
   }
 });
 

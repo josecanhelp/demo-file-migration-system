@@ -29,6 +29,28 @@
   </header>
 
   <main class="layout">
+    <section class="panel intro-panel" aria-labelledby="intro-heading">
+      <div class="panel-header">
+        <h2 id="intro-heading">What this page shows</h2>
+      </div>
+      <p class="panel-explain">
+        Files move out of an old database and into new, permanent storage: each file's bytes go to
+        object storage, and its details, including text pulled from it, go to a new database.
+      </p>
+      <ul class="intro-list">
+        <li><strong>Restart demo</strong>, in Controls below, wipes everything, source rows,
+          migrated data, and stored files, then reloads the same 500 files this demo starts with.</li>
+        <li><strong>Add files</strong> puts new rows in the old database. They travel the exact
+          same path as the original 500, nothing about them is special.</li>
+        <li><strong>Watch a file move</strong> in the Pipeline panel below: it reads left to right,
+          from Original files through to Stored, and a chip steps across the columns as each file
+          progresses.</li>
+        <li><strong>Vendor mode</strong> controls the service that reads each file's text. Offline
+          simulates an outage: the circuit breaker opens, work pauses instead of failing, and
+          nothing is lost. Switching back to working drains everything that queued up, on its own.</li>
+      </ul>
+    </section>
+
     <section class="panel controls-panel" aria-labelledby="controls-heading">
       <div class="panel-header">
         <h2 id="controls-heading">Controls</h2>
@@ -54,6 +76,10 @@
         <div class="control-group">
           <button id="reconcile-btn" class="btn">Run reconciliation</button>
           <span class="control-hint" id="reconcile-hint"></span>
+        </div>
+        <div class="control-group restart-group">
+          <button id="restart-btn" type="button" class="btn btn-danger">Restart demo</button>
+          <span class="control-hint" id="restart-hint"></span>
         </div>
       </div>
       <div class="reconcile-result" id="reconcile-result"></div>

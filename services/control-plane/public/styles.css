@@ -410,6 +410,31 @@ body {
   margin-top: 6px;
 }
 
+.intro-panel .panel-explain {
+  margin-bottom: 8px;
+}
+
+.intro-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  color: var(--muted);
+  max-width: 90ch;
+}
+
+.intro-list li {
+  margin-bottom: 4px;
+  line-height: 1.4;
+}
+
+.intro-list li:last-child {
+  margin-bottom: 0;
+}
+
+.intro-list strong {
+  color: var(--text);
+}
+
 .controls-grid {
   display: flex;
   gap: 24px;
@@ -472,6 +497,26 @@ body {
 .btn-primary {
   background: var(--cdc);
   border-color: var(--cdc);
+  color: #fff;
+}
+
+.restart-group {
+  margin-left: auto;
+}
+
+.btn-danger {
+  background: var(--red-soft);
+  border-color: var(--red);
+  color: var(--red);
+}
+
+.btn-danger:hover {
+  filter: brightness(0.95);
+}
+
+.btn-danger.confirming {
+  background: var(--red);
+  border-color: var(--red);
   color: #fff;
 }
 
