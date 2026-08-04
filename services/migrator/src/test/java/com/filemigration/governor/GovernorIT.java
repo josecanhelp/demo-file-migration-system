@@ -16,6 +16,7 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestInstance;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -26,7 +27,10 @@ import org.springframework.kafka.listener.MessageListenerContainer;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.web.client.RestClient;
 
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -66,14 +70,19 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * poll loop.
  *
  * Every id this test seeds uses its own reserved source id range, well
- * clear of every other IT's, and is removed after each test regardless of
- * outcome. That removal is also done before a test seeds an id, not only
- * after: an aborted or forcibly killed run never gets to its own cleanup,
- * and this class reuses the same fixed ids on every run rather than
- * generating fresh ones, so a row left behind by a prior aborted run would
- * otherwise collide with this run's own insert into migration_state on the
- * very same id. The backfill, cdc, and dlq topics and consumer groups are
- * private to this test class, distinct from the real names the live
+ * clear of every other IT's. Within that range, BASE_ID itself moves on
+ * every run (see nextRunSlot()), rotating through a fixed set of
+ * non-overlapping slots so that two runs can never insert into the same
+ * source id, even if one of them was killed before it ever reached its
+ * own cleanup. Cleanup after each test still runs regardless of outcome,
+ * but only after confirming the backfill and cdc lanes have actually
+ * finished committing everything published during that test: deleting a
+ * ledger or source row while a message naming it can still be redelivered
+ * is what manufactures a "Source record no longer exists" failure that
+ * counts toward the retry cap for no real reason, so cleanup drains each
+ * lane first, deletes, and then confirms the range actually stays empty
+ * before moving on. The backfill, cdc, and dlq topics and consumer groups
+ * are private to this test class, distinct from the real names the live
  * migrator-worker container uses, so this test never contends with, or
  * depends on the pace of, whatever that container is doing against the
  * same compose network. The vendor itself, and the shared vendor circuit
@@ -113,13 +122,82 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
         "spring.kafka.listener.poll-timeout=1000"
 })
 @ActiveProfiles("worker")
+@TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class GovernorIT {
 
-    private static final long BASE_ID = 9_600_000L;
+    private static final String BACKFILL_TOPIC = "files.backfill.governor-it";
+    private static final String BACKFILL_GROUP_ID = "backfill-governor-it";
+    private static final String CDC_TOPIC = "cdc.sourcedb.files.governor-it";
+    private static final String CDC_GROUP_ID = "cdc-governor-it";
+
+    /** The lowest id this class ever reserves; ReconcileIT's own range starts at 9,700,000. */
+    private static final long RANGE_FLOOR = 9_600_000L;
+    private static final long RANGE_CEILING = 9_700_000L;
+    /** The widest span of ids, relative to BASE_ID, any test method in this class seeds. */
+    private static final long RUN_SLOT_WIDTH = 1_000L;
+    private static final long RUN_SLOT_COUNT = (RANGE_CEILING - RANGE_FLOOR) / RUN_SLOT_WIDTH;
+    /**
+     * Where a run's own id range starts within [RANGE_FLOOR, RANGE_CEILING).
+     * Computed once per run by rotating through RUN_SLOT_COUNT fixed slots
+     * (see nextRunSlot()), so a run started immediately after a prior one
+     * was killed, before that prior run's own cleanup ever ran, still gets
+     * a slot the prior run never touched rather than reusing it.
+     */
+    private static final long BASE_ID = RANGE_FLOOR + nextRunSlot() * RUN_SLOT_WIDTH;
+
     private static final Duration DETECTION_TIMEOUT = Duration.ofSeconds(40);
     private static final Duration RECOVERY_TIMEOUT = Duration.ofSeconds(30);
     private static final Duration POLL_INTERVAL = Duration.ofMillis(250);
+    /** How long cleanup waits for both lanes to finish committing every message before it is safe to delete. */
+    private static final Duration LANE_DRAIN_TIMEOUT = Duration.ofSeconds(40);
+    /** How long the range this test just cleaned must read empty, continuously, before cleanup calls it done. */
+    private static final Duration CLEANUP_STABILITY_WINDOW = Duration.ofSeconds(2);
+    /**
+     * Bounds how long cleanup will keep re-deleting a reappearing row
+     * before failing loudly instead of hanging. Every insert or delete
+     * this class makes against the real MySQL files table is a real row
+     * change, so the real Debezium connector captures it independently of
+     * this class's own private topics, and the real, always-running
+     * migrator-worker container can claim and reprocess an id after this
+     * method's own delete already ran, the same real-pipeline race
+     * ReconcileIT's own cleanup ceiling accounts for. That container's own
+     * nack backoff and retry cap (10 seconds and 5 attempts by default)
+     * put a single stale envelope's own retry chain at roughly 50 seconds;
+     * this leaves margin against more than one envelope for the same id
+     * still being queued behind it.
+     */
+    private static final Duration CLEANUP_CEILING = Duration.ofSeconds(120);
+    private static final Duration CLEANUP_POLL_INTERVAL = Duration.ofMillis(500);
     private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+
+    /**
+     * Picks this run's slot by reading the slot the previous run recorded
+     * in a file under this module's build directory, advancing it by one,
+     * and writing the new value back before anything else in this class
+     * runs. The file survives an aborted or killed run, since it is
+     * written here, before BASE_ID is ever used to seed or clean a row,
+     * not at the end of a run; the next run to start reads whatever the
+     * last run to reach this point already wrote and moves past it. Only
+     * a build directory problem (the module was never compiled, or the
+     * file cannot be read or written for some other reason) falls back to
+     * a slot derived from the JVM's own clock, which is not guaranteed to
+     * differ from whatever slot came before, but is different from a
+     * fixed constant that would collide on every single run.
+     */
+    private static long nextRunSlot() {
+        Path counterFile = Path.of("target", "governor-it-run-slot");
+        try {
+            Files.createDirectories(counterFile.getParent());
+            long previousSlot = Files.exists(counterFile)
+                    ? Long.parseLong(Files.readString(counterFile).trim())
+                    : -1;
+            long slot = Math.floorMod(previousSlot + 1, RUN_SLOT_COUNT);
+            Files.writeString(counterFile, Long.toString(slot));
+            return slot;
+        } catch (IOException | NumberFormatException e) {
+            return Math.floorMod(System.nanoTime(), RUN_SLOT_COUNT);
+        }
+    }
 
     @Autowired
     @Qualifier("targetJdbc")
@@ -173,10 +251,7 @@ class GovernorIT {
                     RECOVERY_TIMEOUT, "a Kafka listener container never had its pause request cleared after the "
                             + "breaker closed");
         } finally {
-            for (Long id : seededIds) {
-                cleanRowsForId(id);
-            }
-            seededIds.clear();
+            cleanReservedRunRangeDeterministically();
         }
     }
 
@@ -184,13 +259,18 @@ class GovernorIT {
      * Removes every row a seeded id could have left behind across every
      * table and store this class touches: migration_event, document, and
      * migration_state in the target Postgres, the source row in MySQL, and
-     * its MinIO object, if any. Called both before a test seeds an id (so
+     * its MinIO object, if any. Called only before a test seeds an id, so
      * a row an earlier aborted or forcibly killed run left behind, using
-     * the same fixed id this run is about to reuse, never collides with
-     * this run's own insert) and after, from cleanUpAndRestoreSharedState
-     * (so a normal run leaves nothing behind either). Deleting a row, or
-     * an object, that never existed is a no-op on every one of these
-     * stores, so this is safe to call unconditionally.
+     * an id this run is about to insert into for the first time, never
+     * collides with this run's own insert; BASE_ID moving on every run
+     * (see nextRunSlot()) already keeps that collision from happening in
+     * the ordinary case, so this is a second, cheap layer under that, not
+     * the only thing standing between two runs. Deleting a row, or an
+     * object, that never existed is a no-op on every one of these stores,
+     * so this is safe to call unconditionally. Cleanup after a test runs,
+     * in cleanReservedRunRangeDeterministically below, does not use this:
+     * it deletes by range rather than by id, after first confirming
+     * nothing can still redeliver into that range.
      */
     private void cleanRowsForId(long id) {
         targetJdbc.update("DELETE FROM migration_event WHERE source_id = ?", id);
@@ -200,9 +280,162 @@ class GovernorIT {
         objectStore.delete(objectStore.keyFor(id));
     }
 
+    /**
+     * The deterministic replacement for deleting a seeded id's rows the
+     * moment a test finishes. Order matters here: deleting a ledger or
+     * source row while a backfill or cdc message naming it can still be
+     * redelivered is exactly what turns an ordinary cleanup into a
+     * manufactured "Source record no longer exists for a claimed id"
+     * failure, since that redelivery would seed a fresh row, find nothing
+     * in MySQL behind it, and count the resulting failure toward the
+     * retry cap. Draining both lanes first, so nothing naming any id in
+     * this run's range can still be in flight, then deleting by range, and
+     * then confirming the range actually stays empty rather than trusting
+     * a single pass, is the same three-step shape ReconcileIT's own
+     * cleanup already uses for the identical reason.
+     *
+     * Deliberately not wrapped to force the delete through if the drain
+     * itself times out: a lane that never drains means something is
+     * genuinely still in flight, and deleting anyway is exactly the
+     * unsafe move this method exists to avoid. Letting that failure
+     * propagate leaves this run's range dirty, but BASE_ID moving on the
+     * next run keeps that from colliding with anything, and
+     * noRowsSurviveInThisRunsReservedIdRange still reports it plainly
+     * once every test has run.
+     */
+    private void cleanReservedRunRangeDeterministically() {
+        waitForLanesToDrain();
+        deleteReservedRunRange();
+        waitForReservedRunRangeToStayGone();
+        for (Long id : seededIds) {
+            objectStore.delete(objectStore.keyFor(id));
+        }
+        seededIds.clear();
+    }
+
+    /**
+     * Waits until neither this class's private backfill nor cdc consumer
+     * group has anything left uncommitted on its topic. A record that is
+     * still bouncing through a nack-and-backoff cycle, or one that simply
+     * has not been fetched yet, both show up here the same way: as lag
+     * greater than zero, since only a successful acknowledge advances a
+     * group's committed offset. Both topics carry only this class's own
+     * traffic (see the class-level comment), so zero lag on each is a
+     * direct answer to "can anything published during the test that just
+     * finished still be redelivered," not an approximation of it.
+     */
+    private void waitForLanesToDrain() {
+        waitUntil(() -> totalLag(BACKFILL_GROUP_ID, BACKFILL_TOPIC) == 0 && totalLag(CDC_GROUP_ID, CDC_TOPIC) == 0,
+                LANE_DRAIN_TIMEOUT, "the backfill or cdc lane still had an uncommitted message on its topic; "
+                        + "deleting this run's rows now would risk a redelivery reseeding one of them with "
+                        + "nothing left in MySQL behind it");
+    }
+
+    private void deleteReservedRunRange() {
+        targetJdbc.update("DELETE FROM migration_event WHERE source_id >= ? AND source_id < ?", BASE_ID,
+                BASE_ID + RUN_SLOT_WIDTH);
+        targetJdbc.update("DELETE FROM document WHERE source_id >= ? AND source_id < ?", BASE_ID,
+                BASE_ID + RUN_SLOT_WIDTH);
+        targetJdbc.update("DELETE FROM migration_state WHERE source_id >= ? AND source_id < ?", BASE_ID,
+                BASE_ID + RUN_SLOT_WIDTH);
+        // The MySQL source row is deleted last, and only once
+        // waitForLanesToDrain already confirmed nothing can redeliver into
+        // this range: a message naming one of these ids that is still in
+        // flight when this row disappears is what manufactures the
+        // structural "Source record no longer exists" failure in the
+        // first place.
+        sourceJdbc.update("DELETE FROM files WHERE id >= ? AND id < ?", BASE_ID, BASE_ID + RUN_SLOT_WIDTH);
+    }
+
+    private boolean reservedRunRangeHasRows() {
+        Long ledgerRows = targetJdbc.queryForObject(
+                "SELECT COUNT(*) FROM migration_state WHERE source_id >= ? AND source_id < ?", Long.class, BASE_ID,
+                BASE_ID + RUN_SLOT_WIDTH);
+        Long documentRows = targetJdbc.queryForObject(
+                "SELECT COUNT(*) FROM document WHERE source_id >= ? AND source_id < ?", Long.class, BASE_ID,
+                BASE_ID + RUN_SLOT_WIDTH);
+        Long eventRows = targetJdbc.queryForObject(
+                "SELECT COUNT(*) FROM migration_event WHERE source_id >= ? AND source_id < ?", Long.class, BASE_ID,
+                BASE_ID + RUN_SLOT_WIDTH);
+        Long sourceRows = sourceJdbc.queryForObject(
+                "SELECT COUNT(*) FROM files WHERE id >= ? AND id < ?", Long.class, BASE_ID,
+                BASE_ID + RUN_SLOT_WIDTH);
+        return (ledgerRows != null && ledgerRows > 0) || (documentRows != null && documentRows > 0)
+                || (eventRows != null && eventRows > 0) || (sourceRows != null && sourceRows > 0);
+    }
+
+    /**
+     * Polls this run's reserved range until it has read empty for a full
+     * CLEANUP_STABILITY_WINDOW, re-deleting immediately the moment a row
+     * reappears and starting that window over. waitForLanesToDrain already
+     * makes a reappearance here unlikely, but does not make it impossible,
+     * since a message could still be mid-flight in a way lag alone does
+     * not catch; this is the backstop for that gap, bounded by
+     * CLEANUP_CEILING so a row that keeps coming back well past any
+     * plausible redelivery fails this loudly instead of leaving the range
+     * dirty for whatever test or run comes next.
+     */
+    private void waitForReservedRunRangeToStayGone() {
+        Instant ceiling = Instant.now().plus(CLEANUP_CEILING);
+        while (true) {
+            Instant windowStart = Instant.now();
+            boolean reappeared = false;
+            while (Duration.between(windowStart, Instant.now()).compareTo(CLEANUP_STABILITY_WINDOW) < 0) {
+                if (Instant.now().isAfter(ceiling)) {
+                    throw new IllegalStateException("rows in this run's reserved id range [" + BASE_ID + ", "
+                            + (BASE_ID + RUN_SLOT_WIDTH) + ") were still being recreated "
+                            + CLEANUP_CEILING.getSeconds() + " seconds after cleanup started; a redelivery landed "
+                            + "far later than expected, or something outside this test's own lanes is writing "
+                            + "into its reserved range");
+                }
+                sleep(CLEANUP_POLL_INTERVAL);
+                if (reservedRunRangeHasRows()) {
+                    deleteReservedRunRange();
+                    reappeared = true;
+                    break;
+                }
+            }
+            if (!reappeared) {
+                return;
+            }
+        }
+    }
+
     @AfterAll
     static void resetVendorEvenOnFailure() {
         setVendorMode("healthy");
+    }
+
+    /**
+     * The suite-wide guarantee every per-test cleanup above exists to
+     * uphold: once every test method in this class has run its own
+     * cleanup, this run's slice of the reserved id range must hold zero
+     * rows in every store this class ever writes to, not merely the ids a
+     * passing test happened to check. A row surviving here means some
+     * test's cleanup lost a race against a Kafka message still in flight
+     * for one of its ids, and the id is the specific evidence of which
+     * test and which store.
+     */
+    @AfterAll
+    void noRowsSurviveInThisRunsReservedIdRange() {
+        assertEquals(0, countInRunRange(targetJdbc, "migration_state", "source_id"),
+                "migration_state must hold zero rows in this run's reserved id range once every test's cleanup "
+                        + "has finished");
+        assertEquals(0, countInRunRange(targetJdbc, "document", "source_id"),
+                "document must hold zero rows in this run's reserved id range once every test's cleanup has "
+                        + "finished");
+        assertEquals(0, countInRunRange(targetJdbc, "migration_event", "source_id"),
+                "migration_event must hold zero rows in this run's reserved id range once every test's cleanup "
+                        + "has finished");
+        assertEquals(0, countInRunRange(sourceJdbc, "files", "id"),
+                "the MySQL files table must hold zero rows in this run's reserved id range once every test's "
+                        + "cleanup has finished");
+    }
+
+    private long countInRunRange(JdbcTemplate jdbc, String table, String idColumn) {
+        Long count = jdbc.queryForObject("SELECT count(*) FROM " + table + " WHERE " + idColumn + " >= ? AND "
+                + idColumn + " < ?", Long.class, BASE_ID, BASE_ID + RUN_SLOT_WIDTH);
+        return count == null ? 0 : count;
     }
 
     /**
@@ -475,12 +708,14 @@ class GovernorIT {
             long id = BASE_ID + offset + i;
             ids.add(id);
             seededIds.add(id);
-            // Idempotent seeding: a prior run that was aborted before its
-            // own @AfterEach ran could have left a row behind on this exact
-            // id, since every run reuses the same fixed ids rather than
-            // generating fresh ones. Without this, the INSERT below would
-            // fail with a duplicate key on migration_state instead of this
-            // test ever getting to run.
+            // Idempotent seeding: BASE_ID moving on every run keeps a
+            // fresh run from ever choosing an id a prior run is still
+            // using, but a run whose own slot wrapped back around to one
+            // used RUN_SLOT_COUNT runs ago, and was killed before its own
+            // @AfterEach ran, could still have left a row behind on this
+            // exact id. Without this, the INSERT below would fail with a
+            // duplicate key on migration_state instead of this test ever
+            // getting to run.
             cleanRowsForId(id);
             insertSourceFile(id, "outage-" + id + ".txt", "text/plain",
                     ("GOVERNOR IT " + id).getBytes(StandardCharsets.UTF_8));
