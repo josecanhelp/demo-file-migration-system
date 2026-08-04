@@ -13,7 +13,7 @@ This README is mostly an argument. Here is the design anyone reaches for first, 
 where it fails, and here is what this implementation does instead. Running instructions are
 further down.
 
-**Live demo:** `TODO: paste the hosted dashboard URL here.`
+**Live demo:** [filemigrationdemo.josecanhelp.com](https://filemigrationdemo.josecanhelp.com)
 
 ## The straightforward design
 

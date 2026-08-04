@@ -37,8 +37,6 @@ ssm_param_default() {
 
 log "reading configuration from SSM Parameter Store under ${PARAM_PREFIX}"
 DOMAIN=$(ssm_param "domain")
-BASIC_AUTH_USER=$(ssm_param "basic-auth-user")
-BASIC_AUTH_HASH=$(ssm_param "basic-auth-hash")
 GITHUB_REPO=$(ssm_param "github-repo")
 IMAGE_TAG=$(ssm_param_default "image-tag" "latest")
 
@@ -73,8 +71,6 @@ GHCR_NAMESPACE="ghcr.io/$(echo "$GITHUB_REPO" | tr '[:upper:]' '[:lower:]')"
 
 cat > "$APP_DIR/.env.prod" <<EOF
 DOMAIN=${DOMAIN}
-BASIC_AUTH_USER=${BASIC_AUTH_USER}
-BASIC_AUTH_HASH=${BASIC_AUTH_HASH}
 GHCR_NAMESPACE=${GHCR_NAMESPACE}
 IMAGE_TAG=${IMAGE_TAG}
 EOF

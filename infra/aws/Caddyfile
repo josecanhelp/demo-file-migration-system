@@ -1,18 +1,7 @@
-# Fronts control-plane:8080 (the dashboard and its API) with basic auth
-# and a real Let's Encrypt certificate for the domain pointed at this
-# instance. Domain, username, and the bcrypt hash of the password all
-# come from the environment so nothing secret is committed; see
-# docs/DEPLOYMENT.md for where those values live and how to generate the
-# hash.
-#
-# basic_auth is the caddy image's directive name from v2.8.0 onward
-# (renamed from basicauth in earlier 2.x releases). The caddy service in
-# docker-compose.prod.yml pins the 2.8 line, so this file and the image
-# version have to move together if either changes.
+# Fronts control-plane:8080 (the dashboard and its API) with a real Let's
+# Encrypt certificate for the domain pointed at this instance. The domain
+# comes from the environment so nothing secret is committed; see
+# docs/DEPLOYMENT.md for where that value lives.
 {$DOMAIN} {
-	basic_auth {
-		{$BASIC_AUTH_USER} {$BASIC_AUTH_HASH}
-	}
-
 	reverse_proxy control-plane:8080
 }

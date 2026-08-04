@@ -120,10 +120,10 @@ services:
     ports: !reset []
     mem_limit: 96m
 
-  # The only service with a host port. basic_auth and the domain, user,
-  # and password hash it reads all live in infra/aws/Caddyfile; the
-  # values come from the environment at container start, filled in by
-  # infra/aws/scripts/deploy.sh from SSM Parameter Store.
+  # The only service with a host port. The domain it reads lives in
+  # infra/aws/Caddyfile; the value comes from the environment at
+  # container start, filled in by infra/aws/scripts/deploy.sh from SSM
+  # Parameter Store.
   #
   # caddy_data holds the acquired certificate and caddy_config holds
   # Caddy's autosave state; without both as named volumes, every restart
@@ -141,8 +141,6 @@ services:
       - "443:443"
     environment:
       DOMAIN: ${DOMAIN}
-      BASIC_AUTH_USER: ${BASIC_AUTH_USER}
-      BASIC_AUTH_HASH: ${BASIC_AUTH_HASH}
     volumes:
       - ./infra/aws/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data

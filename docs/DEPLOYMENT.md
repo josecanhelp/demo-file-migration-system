@@ -1,10 +1,11 @@
 # Deployment
 
 The whole stack runs on one ARM EC2 instance. Caddy is the only thing reachable from the
-internet: it terminates real HTTPS on your domain, sits in front of the dashboard behind basic
-auth, and everything else (MySQL, Postgres, Kafka, Connect, MinIO, the migrator services) stays
-on the instance's internal docker network. There is no load balancer and no NAT gateway; neither
-is needed for a single instance in a public subnet.
+internet: it terminates real HTTPS on your domain and reverse proxies to the dashboard, and
+everything else (MySQL, Postgres, Kafka, Connect, MinIO, the migrator services) stays on the
+instance's internal docker network. There is no load balancer and no NAT gateway; neither is
+needed for a single instance in a public subnet. See "Security posture, honestly" below before
+pointing this at anything you care about keeping private.
 
 ## Prerequisites
 
@@ -24,24 +25,13 @@ deploy, using the standard (free) parameter tier:
 | Parameter | Example value | Notes |
 | --- | --- | --- |
 | `/file-migration-system/domain` | `files.example.com` | The domain Caddy requests a certificate for. |
-| `/file-migration-system/basic-auth-user` | `admin` | Dashboard username. |
-| `/file-migration-system/basic-auth-hash` | `$2a$14$...` | Bcrypt hash of the dashboard password. Store as `SecureString`. See below for how to generate it. |
 | `/file-migration-system/github-repo` | `josecanhelp/demo-file-migration-system` | Used to find deploy.sh on first boot and to derive the ghcr.io image path. |
 | `/file-migration-system/image-tag` | `latest` | Which image tag to run. The deploy workflow overwrites this with the commit sha on every push to main; it only needs a manual value the first time. |
-
-Generate the bcrypt hash with the caddy image itself, so the hashing algorithm always matches
-what the running Caddyfile expects:
-
-```bash
-docker run --rm caddy:2.8-alpine caddy hash-password --plaintext 'your-password-here'
-```
 
 Set the parameters:
 
 ```bash
 aws ssm put-parameter --name /file-migration-system/domain --type String --value "files.example.com"
-aws ssm put-parameter --name /file-migration-system/basic-auth-user --type String --value "admin"
-aws ssm put-parameter --name /file-migration-system/basic-auth-hash --type SecureString --value '$2a$14$...'
 aws ssm put-parameter --name /file-migration-system/github-repo --type String --value "josecanhelp/demo-file-migration-system"
 aws ssm put-parameter --name /file-migration-system/image-tag --type String --value "latest"
 ```
@@ -72,8 +62,8 @@ with the commit sha, and tells the instance to pull and restart. It authenticate
 OIDC role assumption rather than long-lived access keys.
 
 Setting up the role this authenticates as, and diagnosing it when it fails, are both covered
-together below, since the same failure this section opens with is most often caused by getting
-one piece of that setup wrong.
+below: first how to create it, then the sequence of errors that show up if a piece of that setup
+is wrong, in the order they tend to surface.
 
 Then set, in the repository's GitHub Actions settings:
 
@@ -85,33 +75,7 @@ No secret needs to hold ghcr credentials; the workflow pushes images using the a
 issued `GITHUB_TOKEN`, scoped by the `packages: write` permission already set in the workflow
 file.
 
-### Troubleshooting: "Credentials could not be loaded"
-
-If the `deploy` job's `configure-aws-credentials` step fails with:
-
-```
-Credentials could not be loaded, please check your action inputs: Could not load credentials
-from any providers
-```
-
-that message is what this action reports whenever `role-to-assume` resolves to an empty string.
-The workflow reads that value from the `AWS_DEPLOY_ROLE_ARN` secret; check that name specifically,
-since a mismatch there is the single most common cause. In order of likelihood:
-
-- `AWS_DEPLOY_ROLE_ARN` was never set on this repository, was set on an environment the `deploy`
-  job does not use, or was created under a slightly different name (`AWS_ROLE_ARN`,
-  `DEPLOY_ROLE_ARN`, a typo) than the one the workflow actually reads.
-- `AWS_DEPLOY_ROLE_ARN` is set but empty.
-- The `token.actions.githubusercontent.com` OIDC identity provider does not exist in the target
-  AWS account yet. `configure-aws-credentials` cannot exchange the workflow's OIDC token for
-  credentials without it, and unlike the missing-secret case this fails inside the `AssumeRole`
-  call rather than before it, but it is worth ruling out at the same time.
-- The role's trust policy `sub` condition does not match the `sub` claim the token actually
-  carries for this run. See the note below; this is the case that most often works locally, or on
-  `main`, and fails everywhere else.
-- The `deploy` job is missing `permissions: id-token: write`. Without it, GitHub never mints an
-  OIDC token for the job to present, so there is nothing for `configure-aws-credentials` to
-  exchange regardless of how correct the secret and the trust policy are.
+### Setting up the deploy role
 
 Create the OIDC identity provider once per account, if it does not already exist from another
 project:
@@ -196,15 +160,103 @@ aws iam put-role-policy \
 Then set `AWS_DEPLOY_ROLE_ARN` on the repository to that role's ARN, exactly as named: this is the
 one secret the `deploy` job reads for `role-to-assume`.
 
-**On `sub` matching the ref that actually ran.** The trust policy above matches only
-`repo:josecanhelp/demo-file-migration-system:ref:refs/heads/main`, because the `deploy` job only
-ever runs on a push to `main`. A pull request run carries a different `sub`
+### Troubleshooting OIDC role assumption
+
+The `configure-aws-credentials` step fails in a specific order as each piece of the setup above
+gets fixed, one error uncovering the next. That ordering is itself useful: which message you are
+looking at tells you roughly how much of the setup is already correct.
+
+**1. Empty or misnamed secret.**
+
+```
+Credentials could not be loaded, please check your action inputs: Could not load credentials
+from any providers
+```
+
+This is what the action reports whenever `role-to-assume` resolves to an empty string, before it
+ever talks to AWS. The workflow reads that value from the `AWS_DEPLOY_ROLE_ARN` secret; check
+that name specifically, since a mismatch there is the single most common cause: the secret was
+never set on this repository, was set on an environment the `deploy` job does not use, or was
+created under a slightly different name (`AWS_ROLE_ARN`, `DEPLOY_ROLE_ARN`, a typo) than the one
+the workflow actually reads. Also confirm the `deploy` job still has `permissions: id-token:
+write`; without it, GitHub never mints an OIDC token for the job to present, and
+`configure-aws-credentials` has nothing to exchange regardless of how correct the secret is.
+
+**2. Missing OIDC provider.**
+
+```
+Error: Could not assume role with OIDC: The web identity token provided could not be validated
+```
+
+Once the secret resolves to something, this is what AWS returns when the
+`token.actions.githubusercontent.com` OIDC identity provider does not exist yet in the target
+account. Create it with the `create-open-id-connect-provider` command above.
+
+**3. Invalid ARN.**
+
+```
+Error: Could not assume role with OIDC: Request ARN is invalid
+```
+
+This shows up when the secret holds an ARN that is not a role `configure-aws-credentials` can
+assume, most often the OIDC provider's own ARN pasted in by mistake instead of the role's, or a
+role ARN with a typo in the account id or region. Confirm the secret is the role ARN from
+`create-role`'s output, not the provider ARN from the step before it.
+
+**4. Immutable subject claims.**
+
+```
+Error: Could not assume role with OIDC: Not authorized to perform sts:AssumeRoleWithWebIdentity
+```
+
+With the provider in place, the role existing, and the audience correct, this is the case that
+took four rounds of debugging to run down, because no public example warns about it: some
+repositories, this one included, have GitHub's immutable subject claims setting turned on, which
+appends the numeric owner and repository ids to the `sub` claim with an `@`:
+
+```
+repo:OWNER@OWNER_ID/REPO@REPO_ID:ref:refs/heads/main
+```
+
+rather than the form every standard example uses:
+
+```
+repo:OWNER/REPO:ref:refs/heads/main
+```
+
+A trust policy copied from any standard example, including the one earlier in this section,
+matches the second form and will never match the first, and the resulting error gives no hint
+that the subject is the problem; it looks identical to a garden-variety trust policy typo.
+
+To confirm this is what is happening, add a step before `configure-aws-credentials` that requests
+the job's own OIDC token and prints only its decoded claims, never the token itself, the token is
+a live credential and must not be echoed:
+
+```yaml
+- name: Print the OIDC subject this job presents
+  run: |
+    token=$(curl -sS \
+      -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+      "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r .value)
+    echo "$token" | cut -d. -f2 | base64 -d 2>/dev/null \
+      | jq '{sub, aud, repository, ref, event_name, workflow}'
+```
+
+Compare the printed `sub` against the trust policy's `StringLike` condition. If it carries the
+`OWNER@OWNER_ID/REPO@REPO_ID` form, that is the mismatch. Fix it by setting the trust policy's
+`sub` condition to the exact string the token presents, ids and all. Matching on the numeric ids
+rather than the name form is also the more robust choice going forward, since the ids survive an
+owner or repository rename and the names do not. Remove the debug step again once the trust
+policy matches; it has no reason to run on every deploy.
+
+**On `sub` matching the ref that actually ran.** The trust policy in this section matches only a
+push to `main`, whatever form the `sub` takes. A pull request run carries a different `sub`
 (`repo:<owner>/<repo>:pull_request`), and a tag build carries yet another one
 (`repo:<owner>/<repo>:ref:refs/tags/<tag>`); neither matches this trust policy, and
-`AssumeRoleWithWebIdentity` will simply be denied rather than fall back to anything else. This is
-the same "Credentials could not be loaded" error at the surface, so it is easy to mistake for a
-missing secret when the actual cause is a workflow running under a different ref than the trust
-policy expects.
+`AssumeRoleWithWebIdentity` will simply be denied rather than fall back to anything else. This
+surfaces as the immutable-subject-claims error above even when the real cause is a workflow
+running under a different ref than the trust policy expects, so rule out the ref before assuming
+the ids are wrong.
 
 This matters for the split between `deploy.yml` and `integration.yml`: the integration suite now
 also runs on pull requests, but it never assumes this role or touches AWS at all, so nothing about
@@ -252,8 +304,8 @@ AWS Pricing Calculator for current numbers before relying on these for budgeting
 | Load balancer | $0 (none provisioned) |
 | **Total** | **about $27/month** |
 
-Data transfer beyond the free monthly allowance bills per GB; a low-traffic demo behind basic
-auth is unlikely to reach it. Switching the instance type to t4g.large roughly doubles the
+Data transfer beyond the free monthly allowance bills per GB; a low-traffic demo is unlikely to
+reach it. Switching the instance type to t4g.large roughly doubles the
 compute line and removes the need for the memory tuning in `docker-compose.prod.yml`.
 
 ## Tearing down
@@ -269,10 +321,25 @@ Delete either by hand if you want them gone too.
 
 ## Security posture, honestly
 
-This deploys a demo system with no application-level authentication of its own. Basic auth in
-front of the dashboard, backed by a single shared username and password, is the only thing
-standing between the internet and the control plane's API. There is no per-user access, no
-audit log of who did what, and no rate limiting beyond what Caddy does by default. The security
-group, which allows only 80 and 443 in and nothing else, is the primary control; treat the
-basic auth password as sensitive but not as the main line of defense, and do not point this setup
-at real user data.
+There is no authentication. Every endpoint, the dashboard and the control plane's API behind it,
+is open to anyone who has the URL. Nothing in front of Caddy asks for a credential, and nothing
+in the application layer checks for one either.
+
+The URL itself is not a secret even if you never share it. Certificate Transparency logs publish
+every certificate Let's Encrypt issues, including the domain name on it, so the hostname is
+publicly discoverable the moment Caddy requests its first certificate, independent of who you
+send the link to.
+
+The consequence is specific: anyone who finds or is given the URL can add files, change the
+vendor's failure mode, and trigger the restart endpoint, which wipes the databases and object
+store and reseeds them from scratch.
+
+What actually limits the blast radius: the demo resets to a known state on restart, it holds no
+real data, MySQL, Postgres, and MinIO all use their documented default credentials, and the
+security group admits only ports 80 and 443, nothing else.
+
+This is a temporary, disposable demo meant to be clicked by whoever receives the link. The
+honest recommendation is to stop the instance when it is not being shown, and to leave the old
+`/file-migration-system/basic-auth-user` and `/file-migration-system/basic-auth-hash` SSM
+parameters out of any future setup; deploy.sh no longer reads them, and they can be deleted from
+the account if nothing else uses them.

@@ -21,8 +21,6 @@ const DEFAULT_INSTANCE_TYPE = 't4g.medium';
 const PARAMETER_PREFIX = '/file-migration-system';
 export const SSM_PARAMETER_NAMES = {
   domain: `${PARAMETER_PREFIX}/domain`,
-  basicAuthUser: `${PARAMETER_PREFIX}/basic-auth-user`,
-  basicAuthHash: `${PARAMETER_PREFIX}/basic-auth-hash`,
   githubRepo: `${PARAMETER_PREFIX}/github-repo`,
   imageTag: `${PARAMETER_PREFIX}/image-tag`,
 };

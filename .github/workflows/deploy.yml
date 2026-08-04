@@ -112,18 +112,6 @@ jobs:
       id-token: write
       contents: read
     steps:
-      # Prints the identity claims this job presents to AWS, so a role trust
-      # policy that refuses the request can be compared against the real
-      # subject rather than an assumed one. Only the claims are decoded and
-      # printed; the token itself is a live credential and never echoed.
-      - name: Show the OIDC subject this job presents
-        run: |
-          token=$(curl -sS \
-            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r .value)
-          echo "$token" | cut -d. -f2 | base64 -d 2>/dev/null \
-            | jq '{sub, aud, repository, ref, event_name, workflow}'
-
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
