@@ -1,0 +1,154 @@
+# Overlay applied on top of docker-compose.yml for the single-instance AWS
+# deployment described in docs/DEPLOYMENT.md. Local development is
+# untouched: `docker compose up` with no -f flags still reads only the base
+# file and behaves exactly as it does today.
+#
+# Usage: docker compose -f docker-compose.yml -f docker-compose.prod.yml ...
+#
+# Three things every service below is doing, for the same set of reasons:
+#
+# 1. The four built services (control-plane, migrator-worker,
+#    migrator-coordinator, vendor-mock) and the seeder get an `image:`
+#    pointing at ghcr.io instead of a local `build:`, so the instance never
+#    needs the Java toolchain, the source tree, or build time. `build:
+#    !reset null` removes the inherited build section outright; leaving it
+#    in place alongside `image:` would make compose fall back to building
+#    locally whenever the image was not already present.
+#
+# 2. `ports: !reset []` removes every host port publication inherited from
+#    the base file. Compose's default merge behavior concatenates port
+#    lists across files rather than replacing them, so simply omitting
+#    `ports:` here would leave the base file's host ports published
+#    alongside anything added here; `!reset` is the explicit way to clear
+#    an inherited list instead of extending it. Caddy is the only service
+#    below that publishes anything.
+#
+# 3. Memory limits and heap caps bring the stack, which measured about
+#    3.3 GiB RSS with no caps at all, down to something that fits
+#    comfortably on a 4 GiB t4g.medium. Bump the instance to t4g.large in
+#    infra/aws and this tuning stops being load-bearing, but leaving it in
+#    place there costs nothing.
+services:
+  mysql:
+    ports: !reset []
+    mem_limit: 480m
+    # The base file bind-mounts the whole infra/mysql/conf directory at
+    # /etc/mysql/conf.d. Adding a second file-level mount nested inside
+    # that same directory mount is unreliable across container runtimes,
+    # so this replaces the volumes list outright with the same two config
+    # files mounted individually, plus the two entries from the base file
+    # that still apply unchanged.
+    volumes: !override
+      - mysql-data:/var/lib/mysql
+      - ./infra/mysql/init:/docker-entrypoint-initdb.d
+      - ./infra/mysql/conf/binlog.cnf:/etc/mysql/conf.d/binlog.cnf:ro
+      - ./infra/aws/config/mysql-prod.cnf:/etc/mysql/conf.d/zz-prod.cnf:ro
+
+  postgres:
+    ports: !reset []
+    mem_limit: 160m
+
+  minio:
+    ports: !reset []
+    mem_limit: 256m
+
+  minio-init:
+    mem_limit: 64m
+
+  # KAFKA_HEAP_OPTS is the cp-kafka image's documented way to set the
+  # broker's JVM heap; the entrypoint passes it straight through to the
+  # kafka-server-start launch. Without it the broker sizes its heap off
+  # the container's visible memory, which on a small instance is more
+  # than this workload needs.
+  kafka:
+    ports: !reset []
+    environment:
+      KAFKA_HEAP_OPTS: "-Xmx512m -Xms512m"
+    mem_limit: 768m
+
+  vendor-mock:
+    build: !reset null
+    image: ${GHCR_NAMESPACE:-ghcr.io/example/example}/vendor-mock:${IMAGE_TAG:-latest}
+    ports: !reset []
+    mem_limit: 64m
+
+  # debezium/connect defaults to a 2 GiB max heap (-Xms256M -Xmx2G) if
+  # KAFKA_HEAP_OPTS is not set, which alone would blow the instance's
+  # entire memory budget. The image reads the same KAFKA_HEAP_OPTS
+  # variable as the Kafka broker itself, since both launch through the
+  # same kafka-run-class.sh style entrypoint.
+  connect:
+    ports: !reset []
+    environment:
+      KAFKA_HEAP_OPTS: "-Xmx512m -Xms512m"
+    mem_limit: 768m
+
+  connector-init:
+    mem_limit: 128m
+
+  seeder:
+    build: !reset null
+    image: ${GHCR_NAMESPACE:-ghcr.io/example/example}/seeder:${IMAGE_TAG:-latest}
+    mem_limit: 128m
+
+  # JAVA_TOOL_OPTIONS is read by the java launcher itself, independent of
+  # anything Spring Boot does, so it applies before the application ever
+  # starts. MaxRAMPercentage sizes the heap off the container's cgroup
+  # memory limit (mem_limit below) rather than the host's full memory,
+  # which is what actually keeps the JVM inside its container budget on a
+  # shared instance; the plain -Xmx equivalent would need updating by hand
+  # every time mem_limit changes.
+  migrator-worker:
+    build: !reset null
+    image: ${GHCR_NAMESPACE:-ghcr.io/example/example}/migrator:${IMAGE_TAG:-latest}
+    ports: !reset []
+    environment:
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=60"
+    mem_limit: 576m
+
+  migrator-coordinator:
+    build: !reset null
+    image: ${GHCR_NAMESPACE:-ghcr.io/example/example}/migrator:${IMAGE_TAG:-latest}
+    ports: !reset []
+    environment:
+      JAVA_TOOL_OPTIONS: "-XX:MaxRAMPercentage=60"
+    mem_limit: 448m
+
+  control-plane:
+    build: !reset null
+    image: ${GHCR_NAMESPACE:-ghcr.io/example/example}/control-plane:${IMAGE_TAG:-latest}
+    ports: !reset []
+    mem_limit: 96m
+
+  # The only service with a host port. basic_auth and the domain, user,
+  # and password hash it reads all live in infra/aws/Caddyfile; the
+  # values come from the environment at container start, filled in by
+  # infra/aws/scripts/deploy.sh from SSM Parameter Store.
+  #
+  # caddy_data holds the acquired certificate and caddy_config holds
+  # Caddy's autosave state; without both as named volumes, every restart
+  # would look like a fresh instance to Let's Encrypt and re-request a
+  # certificate, which is rate-limited.
+  caddy:
+    image: caddy:2.8-alpine
+    container_name: caddy
+    restart: unless-stopped
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN}
+      BASIC_AUTH_USER: ${BASIC_AUTH_USER}
+      BASIC_AUTH_HASH: ${BASIC_AUTH_HASH}
+    volumes:
+      - ./infra/aws/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    mem_limit: 64m
+
+volumes:
+  caddy-data:
+  caddy-config:

@@ -1,6 +1,8 @@
 node_modules/
 target/
 dist/
+cdk.out/
+cdk.context.json
 .env
 *.log
 .DS_Store

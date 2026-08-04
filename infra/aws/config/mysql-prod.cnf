@@ -1,0 +1,12 @@
+# Mounted on top of the same /etc/mysql/conf.d directory as
+# infra/mysql/conf/binlog.cnf, picked up through the !includedir line in
+# the image's default my.cnf. The zz- prefix keeps this file's settings
+# sorted after binlog.cnf so it wins if the two ever set the same key,
+# though today they do not overlap.
+#
+# 128M matches innodb_buffer_pool_size's own default, so this is one
+# fewer thing that could silently change if a future MySQL image ships a
+# different default, on an instance sized with a fixed memory budget in
+# mind.
+[mysqld]
+innodb_buffer_pool_size=128M

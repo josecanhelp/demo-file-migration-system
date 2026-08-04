@@ -1,0 +1,166 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  SSM_PARAM_PREFIX: /file-migration-system
+
+jobs:
+  # Fast unit suites plus the migrator's own integration suite, which
+  # brings the whole compose stack up locally on the runner and exercises
+  # it end to end through the real MySQL, Postgres, Kafka, MinIO, and
+  # vendor mock, the same way docs/README.md describes running it by hand.
+  # Nothing here is arm64 or ghcr-specific, so it runs on a plain x86
+  # runner regardless of what the build job below targets.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+          cache-dependency-path: services/migrator/pom.xml
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: yarn
+          cache-dependency-path: services/control-plane/yarn.lock
+
+      - name: Migrator unit tests
+        working-directory: services/migrator
+        run: mvn -B test
+
+      - name: Control plane tests
+        working-directory: services/control-plane
+        run: |
+          yarn install --frozen-lockfile
+          yarn test
+
+      - name: Bring up the full stack
+        run: |
+          cp .env.example .env
+          docker compose up -d --build
+          for i in $(seq 1 60); do
+            unhealthy=$(docker compose ps --format '{{.Health}}' | grep -vc '^healthy$' || true)
+            if [ "$unhealthy" -eq 0 ]; then
+              echo "stack is healthy"
+              break
+            fi
+            sleep 5
+          done
+          docker compose ps
+
+      - name: Migrator integration tests
+        working-directory: services/migrator
+        run: mvn -B verify
+
+      - name: Stack logs on failure
+        if: failure()
+        run: docker compose logs --tail 200
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  # Public repo, so images are free on ghcr.io. Built on GitHub's hosted
+  # arm64 runners rather than x86 plus QEMU: the migrator is a Maven build,
+  # and a JVM compile under QEMU's instruction emulation commonly runs
+  # 5 to 10x slower than native, turning a two minute build into fifteen
+  # or more across four services. Native arm64 runners are free for public
+  # repositories and build at roughly the same speed as the x86 runners
+  # above.
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        service: [control-plane, migrator, vendor-mock, seeder]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image name
+        id: image
+        run: |
+          namespace=$(echo "ghcr.io/${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          echo "name=${namespace}/${{ matrix.service }}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: services/${{ matrix.service }}
+          platforms: linux/arm64
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ github.sha }}
+            ${{ steps.image.outputs.name }}:latest
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}
+
+  # No SSH and no long-lived AWS keys. The role assumed here is restricted,
+  # by its own trust policy, to this repository's workflows (see
+  # docs/DEPLOYMENT.md), and by its permissions policy to writing one SSM
+  # parameter and sending one SSM command to one instance.
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Record the image tag this deploy should run
+        run: |
+          aws ssm put-parameter \
+            --name "${SSM_PARAM_PREFIX}/image-tag" \
+            --type String \
+            --overwrite \
+            --value "${{ github.sha }}"
+
+      - name: Tell the instance to redeploy
+        id: send-command
+        run: |
+          command_id=$(aws ssm send-command \
+            --instance-ids "${{ vars.AWS_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "file-migration-system deploy ${{ github.sha }}" \
+            --parameters 'commands=["cd /opt/app/repo && git fetch origin main && git reset --hard origin/main && ./infra/aws/scripts/deploy.sh"]' \
+            --query "Command.CommandId" --output text)
+          echo "command_id=${command_id}" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for the deploy to finish
+        run: |
+          aws ssm wait command-executed \
+            --command-id "${{ steps.send-command.outputs.command_id }}" \
+            --instance-id "${{ vars.AWS_INSTANCE_ID }}"
+
+      - name: Show what the instance did
+        if: always()
+        run: |
+          aws ssm get-command-invocation \
+            --command-id "${{ steps.send-command.outputs.command_id }}" \
+            --instance-id "${{ vars.AWS_INSTANCE_ID }}"

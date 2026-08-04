@@ -1,0 +1,23 @@
+{
+  "name": "file-migration-system-infra",
+  "version": "1.0.0",
+  "private": true,
+  "description": "CDK app that provisions the single EC2 instance running the file migration stack.",
+  "scripts": {
+    "build": "tsc",
+    "synth": "cdk synth",
+    "diff": "cdk diff",
+    "watch": "tsc -w"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "aws-cdk": "2.1135.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.5.4"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "2.163.0",
+    "constructs": "^10.3.0",
+    "source-map-support": "^0.5.21"
+  }
+}
