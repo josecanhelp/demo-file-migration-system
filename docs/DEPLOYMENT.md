@@ -26,7 +26,7 @@ deploy, using the standard (free) parameter tier:
 | `/file-migration-system/domain` | `files.example.com` | The domain Caddy requests a certificate for. |
 | `/file-migration-system/basic-auth-user` | `admin` | Dashboard username. |
 | `/file-migration-system/basic-auth-hash` | `$2a$14$...` | Bcrypt hash of the dashboard password. Store as `SecureString`. See below for how to generate it. |
-| `/file-migration-system/github-repo` | `youruser/file-migration-system` | Used to find deploy.sh on first boot and to derive the ghcr.io image path. |
+| `/file-migration-system/github-repo` | `josecanhelp/demo-file-migration-system` | Used to find deploy.sh on first boot and to derive the ghcr.io image path. |
 | `/file-migration-system/image-tag` | `latest` | Which image tag to run. The deploy workflow overwrites this with the commit sha on every push to main; it only needs a manual value the first time. |
 
 Generate the bcrypt hash with the caddy image itself, so the hashing algorithm always matches
@@ -42,7 +42,7 @@ Set the parameters:
 aws ssm put-parameter --name /file-migration-system/domain --type String --value "files.example.com"
 aws ssm put-parameter --name /file-migration-system/basic-auth-user --type String --value "admin"
 aws ssm put-parameter --name /file-migration-system/basic-auth-hash --type SecureString --value '$2a$14$...'
-aws ssm put-parameter --name /file-migration-system/github-repo --type String --value "youruser/file-migration-system"
+aws ssm put-parameter --name /file-migration-system/github-repo --type String --value "josecanhelp/demo-file-migration-system"
 aws ssm put-parameter --name /file-migration-system/image-tag --type String --value "latest"
 ```
 
@@ -98,7 +98,7 @@ Create a role trusted only by this repository's workflows on the `main` branch:
           "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
         },
         "StringLike": {
-          "token.actions.githubusercontent.com:sub": "repo:<OWNER>/<REPO>:ref:refs/heads/main"
+          "token.actions.githubusercontent.com:sub": "repo:josecanhelp/demo-file-migration-system:ref:refs/heads/main"
         }
       }
     }
