@@ -1,0 +1,56 @@
+name: Integration
+
+# The migrator's full integration suite, brought up against the real
+# compose stack: MySQL, Postgres, Kafka, Connect, MinIO, and the vendor
+# mock, exercised end to end the same way docs/README.md describes running
+# it by hand. This workflow does NOT gate a deploy; deploy.yml only waits
+# on fast unit tests and a compose config check. Running here on every
+# pull request and once a night is what keeps this coverage automatic
+# without it blocking every push to main.
+on:
+  pull_request:
+  schedule:
+    - cron: "0 9 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+          cache-dependency-path: services/migrator/pom.xml
+
+      - name: Bring up the full stack
+        run: |
+          cp .env.example .env
+          docker compose up -d --build
+          for i in $(seq 1 60); do
+            unhealthy=$(docker compose ps --format '{{.Health}}' | grep -vc '^healthy$' || true)
+            if [ "$unhealthy" -eq 0 ]; then
+              echo "stack is healthy"
+              break
+            fi
+            sleep 5
+          done
+          docker compose ps
+
+      - name: Migrator integration tests
+        working-directory: services/migrator
+        run: mvn -B verify
+
+      - name: Stack logs on failure
+        if: failure()
+        run: docker compose logs --tail 200
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

@@ -174,45 +174,101 @@ class ReconcileIT {
     }
 
     /**
-     * Deletes every row this suite could have written under its reserved id
-     * range, then keeps re-deleting on a timer for a window longer than the
-     * live migrator-worker container's own retry chain can possibly last:
-     * every insert or delete this class makes against the real MySQL files
-     * table is a real row change, so the real Debezium connector captures
-     * it, and that same container's CDC consumer, sharing this database,
-     * can claim and reprocess the id after this method's first delete has
+     * How long a test that wrote to the real MySQL files table is willing
+     * to keep re-deleting a reappearing row before giving up and failing
+     * loudly. Every insert or delete this class makes against that table
+     * is a real row change, so the real Debezium connector captures it,
+     * and that same container's CDC consumer, sharing this database, can
+     * claim and reprocess the id after this method's first delete has
      * already run, re-creating a migration_state row for an id this suite
      * just removed with no source row left to back it. With a 10 second
      * nack backoff and 5 allowed attempts, a single failing message's own
      * retry chain spans roughly 50 seconds after this suite's own change,
      * but the same consumer thread can also be working through other
      * messages queued ahead of it on the same partition first, pushing the
-     * actual wall-clock delay out further still; the sweep below runs for
-     * 100 seconds for margin against that, rather than merely reducing how
-     * often the race is lost. This is a timing-based mitigation, not a
-     * guarantee: a message queued deeply enough behind others can still
-     * arrive after this window closes, which is why cleanUpReservedRows
-     * cannot be the only thing standing between this suite and a stray
-     * row; whatever runs this suite is still responsible for checking the
-     * ledger table is genuinely clean afterward.
+     * actual wall-clock delay out further still; this ceiling leaves
+     * margin against that.
+     */
+    private static final Duration CLEANUP_CEILING = Duration.ofSeconds(100);
+
+    /**
+     * How long the reserved id range must read empty, continuously, before
+     * cleanup is willing to call it done. Short on purpose: in the
+     * ordinary case nothing was ever going to reappear, so this window
+     * closes on its first pass and cleanup exits in a second or two rather
+     * than always waiting out the full ceiling above.
+     */
+    private static final Duration CLEANUP_STABILITY_WINDOW = Duration.ofSeconds(2);
+    private static final Duration CLEANUP_POLL_INTERVAL = Duration.ofMillis(500);
+
+    /**
+     * Deletes every row this suite could have written under its reserved id
+     * range, then, for a test that actually wrote to the real MySQL files
+     * table, confirms the range actually stays empty rather than trusting
+     * a single pass. A test that never touched that table has no Debezium
+     * event in flight to race against, so one plain delete pass is enough.
      */
     @AfterEach
     void cleanUpReservedRows() {
-        // The extended sweep below only matters for a test that actually
-        // wrote to the real MySQL files table; a test that never did has
-        // no Debezium event in flight for it to race against, so one
-        // plain delete pass is enough.
-        Instant deadline = wroteToSourceTable ? Instant.now().plus(Duration.ofSeconds(100)) : Instant.now();
-        do {
-            targetJdbc.update("DELETE FROM document WHERE source_id >= ?", BASE_ID);
-            targetJdbc.update("DELETE FROM migration_state WHERE source_id >= ?", BASE_ID);
-            sourceJdbc.update("DELETE FROM files WHERE id >= ?", BASE_ID);
-            if (Instant.now().isBefore(deadline)) {
-                sleep(Duration.ofSeconds(3));
-            }
-        } while (Instant.now().isBefore(deadline));
+        deleteReservedRows();
+        if (wroteToSourceTable) {
+            waitForReservedRowsToStayGone();
+        }
         for (long id = BASE_ID + 1; id <= BASE_ID + 8; id++) {
             objectStore.delete(objectStore.keyFor(id));
+        }
+    }
+
+    private void deleteReservedRows() {
+        targetJdbc.update("DELETE FROM document WHERE source_id >= ?", BASE_ID);
+        targetJdbc.update("DELETE FROM migration_state WHERE source_id >= ?", BASE_ID);
+        sourceJdbc.update("DELETE FROM files WHERE id >= ?", BASE_ID);
+    }
+
+    private boolean reservedRowsPresent() {
+        Long ledgerRows = targetJdbc.queryForObject(
+                "SELECT COUNT(*) FROM migration_state WHERE source_id >= ?", Long.class, BASE_ID);
+        Long documentRows = targetJdbc.queryForObject(
+                "SELECT COUNT(*) FROM document WHERE source_id >= ?", Long.class, BASE_ID);
+        Long sourceRows = sourceJdbc.queryForObject(
+                "SELECT COUNT(*) FROM files WHERE id >= ?", Long.class, BASE_ID);
+        return (ledgerRows != null && ledgerRows > 0)
+                || (documentRows != null && documentRows > 0)
+                || (sourceRows != null && sourceRows > 0);
+    }
+
+    /**
+     * Polls the reserved id range until it has read empty for a full
+     * CLEANUP_STABILITY_WINDOW, re-deleting immediately the moment a row
+     * reappears and starting that window over: exactly the signature of a
+     * queued CDC redelivery landing after the first delete in
+     * cleanUpReservedRows and recreating a row this suite already removed.
+     * Bounded by CLEANUP_CEILING, so a row that keeps coming back well
+     * past the redelivery chain's own worst case fails this test loudly
+     * instead of leaving the reserved range dirty for whatever runs next.
+     */
+    private void waitForReservedRowsToStayGone() {
+        Instant ceiling = Instant.now().plus(CLEANUP_CEILING);
+        while (true) {
+            Instant windowStart = Instant.now();
+            boolean reappeared = false;
+            while (Duration.between(windowStart, Instant.now()).compareTo(CLEANUP_STABILITY_WINDOW) < 0) {
+                if (Instant.now().isAfter(ceiling)) {
+                    throw new IllegalStateException("rows at or above source_id " + BASE_ID
+                            + " were still being recreated " + CLEANUP_CEILING.getSeconds()
+                            + " seconds after cleanup started; a CDC redelivery landed far later than expected, "
+                            + "or something outside this suite is writing into its reserved range");
+                }
+                sleep(CLEANUP_POLL_INTERVAL);
+                if (reservedRowsPresent()) {
+                    deleteReservedRows();
+                    reappeared = true;
+                    break;
+                }
+            }
+            if (!reappeared) {
+                return;
+            }
         }
     }
 

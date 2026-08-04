@@ -71,6 +71,48 @@ against a fresh local `docker compose up` if anything looks slow to settle.
 with the commit sha, and tells the instance to pull and restart. It authenticates to AWS with
 OIDC role assumption rather than long-lived access keys.
 
+Setting up the role this authenticates as, and diagnosing it when it fails, are both covered
+together below, since the same failure this section opens with is most often caused by getting
+one piece of that setup wrong.
+
+Then set, in the repository's GitHub Actions settings:
+
+- Secret `AWS_DEPLOY_ROLE_ARN`: the deploy role's ARN, created below.
+- Variable `AWS_REGION`: the region the stack was deployed to.
+- Variable `AWS_INSTANCE_ID`: the instance id from the `cdk deploy` output.
+
+No secret needs to hold ghcr credentials; the workflow pushes images using the automatically
+issued `GITHUB_TOKEN`, scoped by the `packages: write` permission already set in the workflow
+file.
+
+### Troubleshooting: "Credentials could not be loaded"
+
+If the `deploy` job's `configure-aws-credentials` step fails with:
+
+```
+Credentials could not be loaded, please check your action inputs: Could not load credentials
+from any providers
+```
+
+that message is what this action reports whenever `role-to-assume` resolves to an empty string.
+The workflow reads that value from the `AWS_DEPLOY_ROLE_ARN` secret; check that name specifically,
+since a mismatch there is the single most common cause. In order of likelihood:
+
+- `AWS_DEPLOY_ROLE_ARN` was never set on this repository, was set on an environment the `deploy`
+  job does not use, or was created under a slightly different name (`AWS_ROLE_ARN`,
+  `DEPLOY_ROLE_ARN`, a typo) than the one the workflow actually reads.
+- `AWS_DEPLOY_ROLE_ARN` is set but empty.
+- The `token.actions.githubusercontent.com` OIDC identity provider does not exist in the target
+  AWS account yet. `configure-aws-credentials` cannot exchange the workflow's OIDC token for
+  credentials without it, and unlike the missing-secret case this fails inside the `AssumeRole`
+  call rather than before it, but it is worth ruling out at the same time.
+- The role's trust policy `sub` condition does not match the `sub` claim the token actually
+  carries for this run. See the note below; this is the case that most often works locally, or on
+  `main`, and fails everywhere else.
+- The `deploy` job is missing `permissions: id-token: write`. Without it, GitHub never mints an
+  OIDC token for the job to present, so there is nothing for `configure-aws-credentials` to
+  exchange regardless of how correct the secret and the trust policy are.
+
 Create the OIDC identity provider once per account, if it does not already exist from another
 project:
 
@@ -81,7 +123,8 @@ aws iam create-open-id-connect-provider \
   --thumbprint-list 6938fd4d98bab03faadb97b34396831e3780aea1
 ```
 
-Create a role trusted only by this repository's workflows on the `main` branch:
+Create the deploy role, trusted only by this repository, with the trust policy below saved as
+`trust-policy.json`:
 
 ```json
 {
@@ -106,8 +149,16 @@ Create a role trusted only by this repository's workflows on the `main` branch:
 }
 ```
 
-Attach a permissions policy scoped to exactly what the deploy job does: write the `image-tag`
-parameter and send one SSM command to one instance.
+```bash
+aws iam create-role \
+  --role-name file-migration-system-deploy \
+  --assume-role-policy-document file://trust-policy.json
+```
+
+Attach a permissions policy scoped to exactly what the `deploy` job does: write the one SSM
+parameter under `/file-migration-system`, send the `AWS-RunShellScript` document to the one
+instance, and read back what it did. This grants none of `ssm:*` or `ec2:*`, only the specific
+actions and resources below, saved as `permissions-policy.json`:
 
 ```json
 {
@@ -135,15 +186,32 @@ parameter and send one SSM command to one instance.
 }
 ```
 
-Then set, in the repository's GitHub Actions settings:
+```bash
+aws iam put-role-policy \
+  --role-name file-migration-system-deploy \
+  --policy-name file-migration-system-deploy \
+  --policy-document file://permissions-policy.json
+```
 
-- Secret `AWS_DEPLOY_ROLE_ARN`: the role's ARN.
-- Variable `AWS_REGION`: the region the stack was deployed to.
-- Variable `AWS_INSTANCE_ID`: the instance id from the `cdk deploy` output.
+Then set `AWS_DEPLOY_ROLE_ARN` on the repository to that role's ARN, exactly as named: this is the
+one secret the `deploy` job reads for `role-to-assume`.
 
-No secret needs to hold ghcr credentials; the workflow pushes images using the automatically
-issued `GITHUB_TOKEN`, scoped by the `packages: write` permission already set in the workflow
-file.
+**On `sub` matching the ref that actually ran.** The trust policy above matches only
+`repo:josecanhelp/demo-file-migration-system:ref:refs/heads/main`, because the `deploy` job only
+ever runs on a push to `main`. A pull request run carries a different `sub`
+(`repo:<owner>/<repo>:pull_request`), and a tag build carries yet another one
+(`repo:<owner>/<repo>:ref:refs/tags/<tag>`); neither matches this trust policy, and
+`AssumeRoleWithWebIdentity` will simply be denied rather than fall back to anything else. This is
+the same "Credentials could not be loaded" error at the surface, so it is easy to mistake for a
+missing secret when the actual cause is a workflow running under a different ref than the trust
+policy expects.
+
+This matters for the split between `deploy.yml` and `integration.yml`: the integration suite now
+also runs on pull requests, but it never assumes this role or touches AWS at all, so nothing about
+it needs to match this trust policy. If AWS credentials are ever added to a pull-request-triggered
+job, its `sub` will not match `ref:refs/heads/main`, and the trust policy (or the workflow's
+`permissions: id-token: write`) will need to account for that deliberately rather than by
+assuming whatever works on `main` also works on a pull request.
 
 ## Getting a shell
 
