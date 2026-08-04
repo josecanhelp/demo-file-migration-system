@@ -29,8 +29,8 @@ few stats ticks the pipeline should already show all 500 as stored.
 
 The dashboard is one page, served by the control plane at port 8080, arranged top to bottom as
 What this page shows, Controls, Pipeline, Freshness, and Recently stored. The first panel is a
-short, plain-language summary of the same five things this walkthrough covers in more detail
-below, aimed at someone opening the page for the first time. Five things worth doing:
+short, plain-language summary aimed at someone opening the page for the first time, paired with a
+numbered sequence to try. Four things worth doing:
 
 **Start clean with Restart demo.** The Controls panel has a **Restart demo** button, styled
 differently from the rest of the row since it is destructive. A single click does not fire it: it
@@ -97,13 +97,8 @@ breach marker. Below it, Recently stored shows the most recently completed files
 each card showing the filename, where it landed (its object key), the extracted text, the OCR
 confidence, and its actual measured end-to-end duration, taken from that file's own event history
 rather than the pipeline's paced animation. A link to the MinIO console is available from the
-panel header to look at a stored object directly.
-
-**Run a reconciliation.** Click **Run reconciliation** (or `POST /api/reconcile`, see below). A
-`clean: true` result means the source table, the ledger, and the target document table agree not
-just on row counts but on the actual id sets and content: every source row has a matching document
-and ledger row and no extra ones exist on either side, every stored checksum and OCR text matches
-what the source blob actually produces, and no row is currently `FAILED_PERMANENT`.
+panel header to look at a stored object directly. Verifying a migration end to end is a separate
+step, `POST /api/reconcile`, covered below; it isn't a dashboard control.
 
 ## Configuration
 
@@ -202,13 +197,13 @@ given replica actually landed on, useful if you want to reach one specific insta
 curl -X POST http://localhost:8080/api/reconcile
 ```
 
-Or click **Run reconciliation** on the dashboard. The result reports row counts across the
-source, ledger, and document tables, plus explicit lists: checksum mismatches, OCR text
-mismatches, missing or unreadable objects, missing or orphaned document rows, missing or orphaned
-ledger rows, and current permanent failures. `clean: true` means every one of those lists is
-empty and all three row counts agree, which is a stronger claim than the counts merely matching:
-a deleted source row and an unrelated orphan row can make two counts agree by coincidence while
-one real file is missing and another is stale, and the id-set checks are what catch that.
+The result reports row counts across the source, ledger, and document tables, plus explicit
+lists: checksum mismatches, OCR text mismatches, missing or unreadable objects, missing or
+orphaned document rows, missing or orphaned ledger rows, and current permanent failures.
+`clean: true` means every one of those lists is empty and all three row counts agree, which is a
+stronger claim than the counts merely matching: a deleted source row and an unrelated orphan row
+can make two counts agree by coincidence while one real file is missing and another is stale, and
+the id-set checks are what catch that.
 
 ## Running the tests
 

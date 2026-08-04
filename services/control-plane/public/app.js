@@ -518,98 +518,12 @@
     }
   }
 
-  // --- reconciliation --------------------------------------------------------
-
-  const RECONCILE_LIST_KEYS = [
-    'checksumMismatches',
-    'ocrMismatches',
-    'missingObjects',
-    'unreadableObjects',
-    'missingDocuments',
-    'orphanDocuments',
-    'missingLedgerRows',
-    'orphanLedgerRows',
-  ];
-
-  function formatListItems(list) {
-    if (!Array.isArray(list) || list.length === 0) {
-      return 'none';
-    }
-    const shown = list.slice(0, 50).map(function (item) {
-      if (item && typeof item === 'object') {
-        const id = item.id !== undefined ? item.id : JSON.stringify(item);
-        const extra = item.error ? ' (' + item.error + ')' : '';
-        return id + extra;
-      }
-      return String(item);
-    });
-    const suffix = list.length > 50 ? ', +' + (list.length - 50) + ' more' : '';
-    return shown.join(', ') + suffix;
-  }
-
-  function renderReconcileResult(result) {
-    const container = document.getElementById('reconcile-result');
-    container.innerHTML = '';
-
-    const banner = document.createElement('div');
-    banner.className = 'reconcile-banner ' + (result.clean ? 'clean' : 'dirty');
-    banner.textContent = result.clean ? 'clean' : 'not clean';
-    container.appendChild(banner);
-
-    const summary = document.createElement('div');
-    summary.className = 'reconcile-summary';
-    const summaryFields = [
-      ['source rows', result.sourceCount],
-      ['ledger rows', result.ledgerCount],
-      ['document rows', result.documentCount],
-      ['rows examined', result.rowsExamined],
-      ['permanent failures', Array.isArray(result.permanentFailures) ? result.permanentFailures.length : 0],
-    ];
-    summaryFields.forEach(function (pair) {
-      const span = document.createElement('span');
-      const valueSpan = document.createElement('span');
-      valueSpan.className = 'stat-value';
-      valueSpan.textContent = String(pair[1]);
-      span.appendChild(document.createTextNode(pair[0] + ': '));
-      span.appendChild(valueSpan);
-      summary.appendChild(span);
-    });
-    container.appendChild(summary);
-
-    const grid = document.createElement('div');
-    grid.className = 'reconcile-lists';
-    RECONCILE_LIST_KEYS.forEach(function (key) {
-      const list = result[key] || [];
-      const card = document.createElement('div');
-      card.className = 'reconcile-list-card' + (list.length > 0 ? ' has-items' : '');
-
-      const heading = document.createElement('h3');
-      const label = document.createElement('span');
-      label.textContent = key;
-      const count = document.createElement('span');
-      count.className = 'list-count';
-      count.textContent = String(list.length);
-      heading.appendChild(label);
-      heading.appendChild(count);
-      card.appendChild(heading);
-
-      const items = document.createElement('div');
-      items.className = 'reconcile-list-items';
-      items.textContent = formatListItems(list);
-      card.appendChild(items);
-
-      grid.appendChild(card);
-    });
-    container.appendChild(grid);
-  }
-
   // --- controls --------------------------------------------------------------
 
   function wireControls() {
     const addFileHint = document.getElementById('add-file-hint');
     const addButtons = Array.prototype.slice.call(document.querySelectorAll('[data-add-count]'));
     const vendorSelect = document.getElementById('vendor-mode-select');
-    const reconcileBtn = document.getElementById('reconcile-btn');
     const restartBtn = document.getElementById('restart-btn');
 
     function setButtonsDisabled(disabled) {
@@ -619,12 +533,11 @@
     }
 
     // Used while a restart is running: every other control is disabled for
-    // its duration, since a restart wipes the exact tables an add, a
-    // vendor mode change, or a reconciliation would otherwise touch.
+    // its duration, since a restart wipes the exact tables an add or a
+    // vendor mode change would otherwise touch.
     function setAllControlsDisabled(disabled) {
       setButtonsDisabled(disabled);
       vendorSelect.disabled = disabled;
-      reconcileBtn.disabled = disabled;
       restartBtn.disabled = disabled;
     }
 
@@ -682,30 +595,6 @@
         // The next stats tick will reassert the actual vendor mode.
       } finally {
         vendorRequestInFlight = false;
-      }
-    });
-
-    const reconcileHint = document.getElementById('reconcile-hint');
-    reconcileBtn.addEventListener('click', async function () {
-      reconcileBtn.disabled = true;
-      reconcileHint.textContent = 'running...';
-      try {
-        const res = await fetch('/api/reconcile', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({}),
-        });
-        const body = await res.json();
-        if (!res.ok) {
-          reconcileHint.textContent = 'failed: ' + (body.message || res.status);
-        } else {
-          reconcileHint.textContent = 'done';
-          renderReconcileResult(body);
-        }
-      } catch (err) {
-        reconcileHint.textContent = 'request failed';
-      } finally {
-        reconcileBtn.disabled = false;
       }
     });
 
