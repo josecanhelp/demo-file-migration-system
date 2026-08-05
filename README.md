@@ -1,16 +1,13 @@
-# file-migration-system
+# File Migration System - Demo
 
 Migrate roughly 15 million files stored as blobs in a MySQL database. Every file goes to a third
 party OCR vendor for text extraction, and the file plus its extracted metadata lands in a new
 system: object storage for the bytes, Postgres for the metadata. While the migration runs, any
 file newly added to the source database must be available in the new system within one hour.
 
-The one hour rule is the hard part. For however many days the migration takes, the same system has
-to be a bulk migration and a live pipeline at once. I built this to see what that actually costs.
-
 **Live demo:** [filemigrationdemo.josecanhelp.com](https://filemigrationdemo.josecanhelp.com)
 
-## The straightforward design
+## The initial design
 
 One cron job, one queue, one consumer. Newest rows first, so fresh files clear the pipeline ahead
 of the old backlog and the one hour requirement takes care of itself.
@@ -33,60 +30,15 @@ It passes a run of a few thousand test rows. At 15 million most of its failure m
 
 ## Where that design breaks
 
-**Detection latency.** The clock starts when a row commits, not when the job next wakes up. A five
-minute interval spends five of the sixty minutes before any work starts, and the rest has to cover
-queue wait behind earlier chunks, the vendor call, retries, the object write, and the metadata
-write. Shortening the interval raises the cost of scanning a 15 million row table. Lengthening it
-spends more of the budget on nothing.
+**Detection latency.** The clock starts when a row commits, not when the job next wakes up. A five minute interval spends five of the sixty minutes before any work starts, and the rest has to cover queue wait behind earlier chunks, the vendor call, retries, the object write, and the metadata write. Shortening the interval raises the cost of scanning a 15 million row table. Lengthening it spends more of the budget on nothing.
 
-**Watermark correctness.** `WHERE updated_at > cursor` is correct only if commit order matches
-timestamp order, and it does not. A transaction that takes its timestamp, runs for a few seconds,
-and commits after the cursor has moved past that timestamp is never selected again. Nothing throws
-and no metric moves, because nothing in the poller's view of the world knows that row exists. The
-rows lost this way are exactly the recently written ones the one hour requirement is about.
+**Watermark correctness.** `WHERE updated_at > cursor` is correct only if commit order matches timestamp order, and it does not. A transaction that takes its timestamp, runs for a few seconds, and commits after the cursor has moved past that timestamp is never selected again.
 
-**Scope.** The query finds inserts. A file updated during the migration keeps its stale extracted
-text in the target, and a file deleted from the source stays there forever. Across a window
-measured in weeks that is not a set of files that are missing, which reconciliation would notice,
-but a growing set that are confidently wrong.
+**Scope.** The query finds inserts. A file updated during the migration keeps its stale extracted text in the target, and a file deleted from the source stays there forever. Across a window measured in weeks that is not a set of files that are missing, but a growing set that are wrong.
 
-**Prioritization.** One sorted queue makes isolation an emergent property of the sort. At high
-backfill volume the sort has to actively hold throughput back for live traffic, and any edge case
-in that logic starves it silently. One queue also produces one lag number, blended across 15
-million old files and the handful written in the last minute, so there is nothing useful to alert
-on.
+**Failure handling.** Three attempts a few seconds apart is a budget sized for one bad request, not a bad hour. A longer outage would produce a large number of messages. Someone still has to reconstruct which files to replay.
 
-**Message payload.** Kafka's default `message.max.bytes` is 1 MB. Blobs on the topic mean a broker
-reconfiguration the first time file sizes creep past it, and every consumer replaying from an
-earlier offset re-reads however many gigabytes of file content sat in the log. Replay stops being a
-routine recovery tool.
-
-**Failure handling.** Three attempts a few seconds apart is a budget sized for one bad request, not
-a bad hour. A longer outage converts the whole in-flight backlog into permanent failures within
-seconds, then sends an alert. Someone still has to reconstruct which files to replay.
-
-**Idempotency.** At-least-once delivery lets a worker call the vendor, get billed for the
-extraction, and crash before writing anything. The redelivery has no way to know that happened, so
-it pays again and risks a duplicate row. At 15 million files a small redelivery rate is a large
-bill.
-
-The vendor caps throughput. Its rate limit times its batch size sets the ceiling, and worker count
-and partition count do not move it.
-
-| Effective throughput | Time to migrate 15,000,000 files |
-| --- | --- |
-| 10 files/s | ~17 days |
-| 100 files/s | ~42 hours |
-| 1,000 files/s | ~4.2 hours |
-
-Same architecture, three completely different projects. Without those numbers written down the
-design can only be agreed with, never checked.
-
-Two more gaps:
-
-- No definition of done and no verification. An empty queue is not proof that 15 million files
-  arrived intact.
-- No cutover. Nothing says how reads move to the new store.
+**Idempotency.** At-least-once delivery lets a worker call the vendor, get billed for the extraction, and crash before writing anything. The redelivery has no way to know that happened, so it pays again and risks a duplicate row. At 15 million files a small redelivery rate is a large bill.
 
 ## What this system does instead
 
@@ -132,94 +84,18 @@ flowchart LR
 ```
 
 **Binlog CDC instead of a timestamp cursor.** Debezium reads the MySQL binlog, so every committed
-change arrives as an ordered event in commit order. No window for a late commit to land behind a
-cursor, no poll interval spending the budget. Inserts, updates and deletes all arrive: an update
-revises the target row, a delete tombstones the ledger row and removes the object. Detection
-latency drops from a poll interval to the time it takes an event to travel. The cost is a Kafka
-Connect worker and a schema history topic that a poller would not need.
+change arrives as an ordered event in commit order. Inserts, updates and deletes all arrive: an update
+revises the target row, a delete tombstones the ledger row and removes the object. The cost is a Kafka Connect worker and a schema history topic that a poller would not need.
 
-**Two independent lanes.** Backfill and live changes are separate topics with separate consumer
-groups, separate rate-limiter shares, and separate lag metrics. `CDC_RESERVED_RATE_PCT` comes off
-the top for the live lane, backfill gets what is left, and a shared permit pool caps the two
-together at the vendor's real budget. Each lane's queue depth is reported on its own, so a starved
-lane is a number you can alert on.
+**Two independent lanes.** Backfill and live changes are separate topics with separate consumer groups, separate rate-limiter shares, and separate lag metrics.
 
-**Claim check.** Debezium excludes the blob column and the backfill lane publishes only ids. Every
-Kafka message carries ids and nothing else; the worker fetches the blob from MySQL when it needs
-it. Message size is independent of file size, and replaying a topic from the start costs a sequence
-of small reads.
+**A ledger with a claim lease.** `migration_state` in Postgres records each file's status, and the OCR payload is written and checkpointed before the object or the document row. A redelivery after a crash finds the cached payload and skips the vendor call, so extraction is paid for once however many times a message comes back.
 
-**A ledger with a claim lease.** `migration_state` in Postgres records each file's status, and the
-OCR payload is written and checkpointed before the object or the document row. A redelivery after a
-crash finds the cached payload and skips the vendor call, so extraction is paid for once however
-many times a message comes back. Claims are leased and renewed on a short interval, scoped to the
-ids a call actually owns, so the lease is sized against the renewal interval rather than the
-slowest possible batch and a dead worker's files are reclaimable in seconds.
+**A governor instead of a retry count.** The rate limiter enforces the vendor's budget across both lanes. The circuit breaker stops calls to a vendor already proven unreachable and pauses every Kafka consumer container in the process, both lanes, so the backlog accumulates on the broker instead of being claimed, failed, and endlessly redelivered. A vendor outage of any length slows the migration down; it never condemns a file.
 
-**A governor instead of a retry count.** The rate limiter enforces the vendor's budget across both
-lanes. The circuit breaker stops calls to a vendor already proven unreachable and pauses every
-Kafka consumer container in the process, both lanes, so the backlog accumulates on the broker
-instead of being claimed, failed, and endlessly redelivered. It resumes on the move to `HALF_OPEN`,
-not only on `CLOSED`, since a paused consumer can never give the breaker a trial call to learn
-from. A vendor outage of any length slows the migration down; it never condemns a file.
+**A dead letter topic.** A file the vendor rejects as unreadable, or one whose source row vanished, is marked `FAILED_PERMANENT` and published to `files.dlq` with its lane, error class, attempt count, and last error, so something downstream can act on it without polling Postgres.
 
-**A dead letter topic.** A file the vendor rejects as unreadable, or one whose source row vanished,
-is marked `FAILED_PERMANENT` and published to `files.dlq` with its lane, error class, attempt count,
-and last error, so something downstream can act on it without polling Postgres. The dashboard lists
-the same files in a Set aside row.
-
-Bytes go to an S3-compatible bucket keyed by source id. The document row carries the checksum, the
-extracted text, the confidence, and the object key.
-
-**A reconciler that compares id sets.** `POST /api/reconcile` walks the source table, the ledger,
-and the document table by id in fixed-size pages, recomputes every checksum and OCR text directly
-from the source blob, and reports explicit sets: missing documents, orphan documents, missing
-ledger rows, orphan ledger rows, checksum mismatches, OCR mismatches, unreadable objects,
-permanent failures. `clean: true` is the definition of done.
-
-Full reasoning per decision, plus known limits, is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
-
-## Defects that only appeared once it was running
-
-Four things I did not catch until the stack was up.
-
-**The retry cap counted the wrong events.** It counted every claim attempt rather than consecutive
-failures. During an outage the breaker flaps between open and half-open by design, and each flap
-reclaims and re-fails the files in flight, so any outage longer than about a minute condemned
-healthy files. The test covering it held the vendor down for two seconds, fewer breaker cycles than
-the cap needed, so it passed. `attempts` is now a lifetime counter that condemns nothing and
-`consecutive_failures` is the gate. The test holds the outage open for 65 seconds and asserts
-throughout.
-
-**The reconciler could bless a broken migration.** Comparing row counts across three tables reports
-clean when one missing row and one orphan row cancel out. It compares id sets now, in both
-directions, on top of recomputing content from the source.
-
-**Partitioning was configured and silently unused.** The topics declared three partitions each and
-the CDC topic was being created with one. Two independent causes: `operation-timeout: 3` in the
-Kafka admin config bound as 3 milliseconds rather than 3 seconds, and `fail-fast: false` swallowed
-the resulting timeout, so topic creation never happened and the broker auto-created at its own
-default the moment anything produced. Separately, the backfill coordinator published with a null
-key, which lets the sticky partitioner drop an entire burst onto one partition. The timeout is
-`30s` now, records are keyed by their first id, and connector registration refuses to proceed
-unless the CDC topic already has the partition count the stack expects.
-
-**Two tests could not fail.** One was guarded by an assumption that skipped the whole class when its
-infrastructure was unreachable, while still reporting green; it is a real integration test against a
-real database now, split from the unit suite by naming convention. The other asserted on global row
-counts across tables earlier runs never cleaned up, so it was measuring leftovers. It captures a
-baseline, asserts on deltas, and cleans up deterministically.
-
-## Quickstart
-
-```bash
-cp .env.example .env
-docker compose up
-```
-
-Wait for `docker compose ps` to report healthy, then open **http://localhost:8080**. On a cold
-start the seeder loads 500 synthetic files into MySQL, the backfill coordinator plans and drains
-them, and the dashboard should show all 500 stored within a few stats ticks.
+Bytes go to an S3-compatible bucket keyed by source id. The document row carries the checksum, the extracted text, the confidence, and the object key.
 
 ## What to try in the demo
 
@@ -235,84 +111,5 @@ them, and the dashboard should show all 500 stored within a few stats ticks.
 - **Start over.** *Restart demo* truncates the source table, clears the target stores, and reloads
   the same corpus. It asks for a second click first.
 
-## Verifying a migration
-
-```bash
-curl -X POST http://localhost:8080/api/reconcile
-```
-
-Reports row counts plus the explicit id-set and content checks described above. `clean: true`
-means every one of those lists is empty.
-
-## Running the tests
-
-Unit tests for the migrator need no infrastructure:
-
-```bash
-cd services/migrator && mvn test
-```
-
-Integration tests run against the real stack, so bring it up first and stop the containerized
-worker and coordinator, every time. Both keep consuming the live topics otherwise, and a container
-claiming a test's own ids fails that test for unrelated reasons. Each integration class that writes
-to the source database checks for those containers and fails immediately with the command to run.
-
-```bash
-docker compose up -d
-docker compose stop migrator-worker migrator-coordinator
-cd services/migrator && mvn verify
-```
-
-Control plane tests:
-
-```bash
-cd services/control-plane && yarn test
-```
-
-## Configuration
-
-Every knob is a `.env` variable. The ones that change the shape of a run:
-
-| Variable | Default | Controls |
-| --- | --- | --- |
-| `VENDOR_RATE_LIMIT_RPS` | `50` | The vendor's request budget per second, enforced across both lanes. With `VENDOR_BATCH_SIZE`, the throughput ceiling. |
-| `VENDOR_BATCH_SIZE` | `25` | Files per OCR call. The backfill lane chunks to this; the live lane sends one id per envelope. |
-| `CDC_RESERVED_RATE_PCT` | `20` | Share of the rate budget held for the live lane, so a saturated backfill cannot starve it. |
-| `WORKER_CONCURRENCY` | `8` | Kafka listener concurrency per lane inside each worker. |
-| `MAX_RETRY_ATTEMPTS` | `5` | The per-call retry cap, and the consecutive-failure cap past which a file is condemned. Never gated on lifetime attempts. |
-| `BREAKER_FAILURE_RATE_THRESHOLD` | `50` | Failure rate percentage that trips the breaker open. |
-| `BREAKER_OPEN_DURATION_SECONDS` | `10` | How long it stays open before letting trial calls through. |
-| `CLAIM_LEASE_SECONDS` | `60` | How long a claimed file stays owned before reclaim. Renewed every `CLAIM_RENEW_INTERVAL_SECONDS`. |
-| `SLA_TARGET_SECONDS` | `3600` | The one hour requirement, as a number the dashboard checks against. |
-| `SEED_FILE_COUNT` | `500` | How many synthetic files a cold start loads. |
-
-<details>
-<summary>Everything else</summary>
-
-The full set, with defaults, is in [.env.example](.env.example): seeder sizing and batching,
-vendor latency and failure mode, backfill range size and lease, plan and nack intervals, topic
-partition counts, DLQ and reconcile batch sizes, JDBC pool size, event polling and SSE limits,
-and service URLs. All of it is plumbed through `docker-compose.yml`.
-
-`MICROBATCH_MAX_WAIT_MS` is declared and wired to nothing; no consumer here batches by a
-wait-time window.
-
-</details>
-
-### Scaling workers
-
-```bash
-docker compose up --scale migrator-worker=4
-```
-
-Four workers consume the same two consumer groups, so partitions rebalance and each instance claims
-a different slice. Total throughput does not change: `VENDOR_RATE_LIMIT_RPS` is shared across all of
-them, and adding workers does not make the vendor accept more calls. Only `migrator-worker` is meant
-to be scaled. It publishes its HTTP port to an ephemeral host port so replicas do not collide;
-`docker compose port migrator-worker 8082` finds a specific one.
-
-## Documentation
-
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): component and request-flow diagrams, the reasoning
-  behind each decision, and known limits.
-- [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md): single-instance AWS deployment, CDK stack, and CI.
+Component diagrams, the Postgres schema, and the known limits are in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
