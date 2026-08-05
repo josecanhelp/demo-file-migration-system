@@ -403,7 +403,6 @@ services:
       STATS_STREAM_INTERVAL_MS: ${STATS_STREAM_INTERVAL_MS:-1000}
       SLA_ALERT_SECONDS: ${SLA_ALERT_SECONDS:-1800}
       SLA_TARGET_SECONDS: ${SLA_TARGET_SECONDS:-3600}
-      MINIO_CONSOLE_URL: ${MINIO_CONSOLE_URL:-http://localhost:9001}
       # Object store access for the restart endpoint, same values
       # migrator-worker and migrator-coordinator already connect with above.
       MINIO_ENDPOINT: http://minio:9000

@@ -70,7 +70,6 @@
   let bulkRequestInFlight = false;
   let vendorRequestInFlight = false;
   let restartRequestInFlight = false;
-  let minioConsoleUrl = 'http://localhost:9001';
   let renderedRecentIds = new Set();
 
   function setPillState(pillEl, valueEl, state, text) {
@@ -681,19 +680,6 @@
     wireControls();
     setInterval(computeThroughput, 500);
     setInterval(pollRecent, RECENT_POLL_INTERVAL_MS);
-    try {
-      const configRes = await fetch('/api/config');
-      if (configRes.ok) {
-        const config = await configRes.json();
-        if (config.minioConsoleUrl) {
-          minioConsoleUrl = config.minioConsoleUrl;
-          const link = document.getElementById('minio-link');
-          link.href = minioConsoleUrl + '/browser/documents';
-        }
-      }
-    } catch (err) {
-      // Falls back to the default set above.
-    }
     try {
       const res = await fetch('/api/stats');
       if (res.ok) {
